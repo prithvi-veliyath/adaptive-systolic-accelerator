@@ -22,8 +22,11 @@ double sc_time_stamp() { return static_cast<double>(g_time); }
 // Mirrors state_e in accel_top.sv.
 enum State {
   S_IDLE = 0, S_BFETCH = 1, S_WLOAD = 2, S_AFETCH = 3,
-  S_COMPUTE = 4, S_WB = 5, S_NEXT = 6, S_DONE = 7
+  S_COMPUTE = 4, S_WB = 5, S_NEXT = 6, S_DONE = 7,
+  S_OS_CLEAR = 8, S_OS_COMPUTE = 9, S_OS_DRAIN = 10
 };
+
+enum Policy { FORCE_WS = 0, FORCE_OS = 1, ADAPTIVE = 2, RESERVED = 3 };
 
 // C is poisoned before every run. The design performs no pre-zeroing
 // pass, so the first K tile must overwrite this value outright; if any
@@ -40,15 +43,25 @@ enum Perf {
 };
 
 struct PhaseCounts {
-  int bfetch = 0, wload = 0, afetch = 0, compute = 0, wb = 0, next = 0, done = 0, other = 0;
-  int total() const { return bfetch + wload + afetch + compute + wb + next + done + other; }
+  int bfetch = 0, wload = 0, afetch = 0, compute = 0, wb = 0, next = 0, done = 0;
+  int os_clear = 0, os_drain = 0, other = 0;
+  int total() const {
+    return bfetch + wload + afetch + compute + wb + next + done +
+           os_clear + os_drain + other;
+  }
   // Cycles the systolic array is actually computing, vs. everything else.
   int useful() const { return compute; }
 };
 
-// Analytical model of the WS schedule. Kept deliberately independent of
-// the RTL so that a disagreement is informative rather than circular.
-static PhaseCounts model_cycles(int M, int Nn, int K) {
+// Analytical models of both schedules, written independently of the RTL
+// so that a disagreement is informative rather than circular.
+//
+// The structural difference that matters: WS tiles K onto the array and
+// streams M, so a K larger than the array forces partial sums out to
+// memory and back (the 2x writeback below). OS tiles M onto the array
+// and streams K, so the reduction completes in place and C is written
+// exactly once, at the cost of re-fetching B for every M tile.
+static PhaseCounts model_ws(int M, int Nn, int K) {
   PhaseCounts p;
   for (int n0 = 0; n0 < Nn; n0 += N_ARR) {
     int n_tile = std::min(N_ARR, Nn - n0);
@@ -68,6 +81,32 @@ static PhaseCounts model_cycles(int M, int Nn, int K) {
   }
   p.done = 1;
   return p;
+}
+
+static PhaseCounts model_os(int M, int Nn, int K) {
+  PhaseCounts p;
+  for (int m0 = 0; m0 < M; m0 += N_ARR) {
+    int m_tile = std::min(N_ARR, M - m0);
+    for (int n0 = 0; n0 < Nn; n0 += N_ARR) {
+      int n_tile = std::min(N_ARR, Nn - n0);
+      p.os_clear += 1;
+      for (int k0 = 0; k0 < K; k0 += STREAM_DEPTH) {
+        int k_chunk = std::min(STREAM_DEPTH, K - k0);
+        p.bfetch  += k_chunk * n_tile;
+        p.afetch  += m_tile * k_chunk;
+        p.compute += k_chunk + m_tile + n_tile - 2;
+      }
+      p.os_drain += N_ARR;   // chain is N_ARR wide regardless of n_tile
+      p.wb       += m_tile * n_tile;  // always a direct write
+      p.next     += 1;
+    }
+  }
+  p.done = 1;
+  return p;
+}
+
+static PhaseCounts model_cycles(int M, int Nn, int K, int policy) {
+  return (policy == 1) ? model_os(M, Nn, K) : model_ws(M, Nn, K);
 }
 
 static int g_failures = 0;
@@ -157,20 +196,23 @@ class Harness {
       case S_WB:      p.wb++;      break;
       case S_NEXT:    p.next++;    break;
       case S_DONE:    p.done++;    break;
+      case S_OS_CLEAR:   p.os_clear++; break;
+      case S_OS_COMPUTE: p.compute++;  break;
+      case S_OS_DRAIN:   p.os_drain++; break;
       default:        p.other++;   break;
     }
   }
 
   PhaseCounts run_gemm(int M, int Nn, int K,
                        const std::vector<int8_t>& A, const std::vector<int8_t>& B,
-                       int max_cycles = 2000000) {
+                       int policy = FORCE_WS, int max_cycles = 2000000) {
     mem.a = A;
     mem.b = B;
     mem.c.assign(static_cast<size_t>(M) * Nn, C_POISON);
     c_writes = 0;
 
     dut->cfg_m = M; dut->cfg_n = Nn; dut->cfg_k = K;
-    dut->cfg_policy = 0;  // FORCE_WS
+    dut->cfg_policy = policy;
     dut->start = 1;
     tick();
     dut->start = 0;
@@ -203,11 +245,11 @@ static void golden(int M, int Nn, int K, const std::vector<int8_t>& A,
 
 // Runs one shape and checks: golden correctness, no surviving poison,
 // exact C write count, and measured-vs-modelled cycles per phase.
-static void shape_test(Harness& h, const std::string& name, int M, int Nn, int K,
+static PhaseCounts shape_test(Harness& h, const std::string& name, int M, int Nn, int K,
                        const std::vector<int8_t>& A, const std::vector<int8_t>& B,
-                       bool verbose = true) {
+                       bool verbose = true, int policy = FORCE_WS) {
   int before = g_failures;
-  PhaseCounts got = h.run_gemm(M, Nn, K, A, B);
+  PhaseCounts got = h.run_gemm(M, Nn, K, A, B, policy);
   std::vector<int32_t> gold;
   golden(M, Nn, K, A, B, gold);
 
@@ -227,15 +269,20 @@ static void shape_test(Harness& h, const std::string& name, int M, int Nn, int K
     }
   }
 
-  // Each output is written once per K tile: once directly, then once per
-  // read-modify-write pass.
+  // WS writes each output once per K tile (once directly, then once per
+  // read-modify-write pass). OS writes each output exactly once, because
+  // the reduction never leaves the array -- this is the core structural
+  // difference between the two dataflows.
+  bool os = (policy == FORCE_OS);
   int k_tiles = (K + N_ARR - 1) / N_ARR;
-  int expect_writes = M * Nn * k_tiles;
+  int expect_writes = os ? (M * Nn) : (M * Nn * k_tiles);
   check(h.c_writes == expect_writes,
         name + ": C writes = " + std::to_string(h.c_writes) + ", expected " +
             std::to_string(expect_writes));
 
-  PhaseCounts exp = model_cycles(M, Nn, K);
+  PhaseCounts exp = model_cycles(M, Nn, K, policy);
+  check(got.os_clear == exp.os_clear, name + ": OS_CLEAR " + std::to_string(got.os_clear) + " vs model " + std::to_string(exp.os_clear));
+  check(got.os_drain == exp.os_drain, name + ": OS_DRAIN " + std::to_string(got.os_drain) + " vs model " + std::to_string(exp.os_drain));
   check(got.bfetch  == exp.bfetch,  name + ": BFETCH "  + std::to_string(got.bfetch)  + " vs model " + std::to_string(exp.bfetch));
   check(got.wload   == exp.wload,   name + ": WLOAD "   + std::to_string(got.wload)   + " vs model " + std::to_string(exp.wload));
   check(got.afetch  == exp.afetch,  name + ": AFETCH "  + std::to_string(got.afetch)  + " vs model " + std::to_string(exp.afetch));
@@ -271,11 +318,16 @@ static void shape_test(Harness& h, const std::string& name, int M, int Nn, int K
         name + ": total-cycle counter disagrees with busy occupancy");
   check(h.perf(PERF_C_WRITES) == static_cast<uint32_t>(expect_writes),
         name + ": C-write counter disagrees with observed writes");
-  check(h.perf(PERF_C_RMW) == static_cast<uint32_t>(M) * Nn * (k_tiles - 1),
+  // OS must never read C back at all: the accumulator stays in the PE
+  // for the entire reduction.
+  check(h.perf(PERF_C_RMW) ==
+            (os ? 0u : static_cast<uint32_t>(M) * Nn * (k_tiles - 1)),
         name + ": C read-modify-write counter wrong");
-  check(h.perf(PERF_WEIGHT_TILES) ==
-            static_cast<uint32_t>(((Nn + N_ARR - 1) / N_ARR) * k_tiles),
-        name + ": weight-tile counter wrong");
+  if (!os) {
+    check(h.perf(PERF_WEIGHT_TILES) ==
+              static_cast<uint32_t>(((Nn + N_ARR - 1) / N_ARR) * k_tiles),
+          name + ": weight-tile counter wrong");
+  }
   // Operand traffic: every A and B element of every tile is fetched once.
   check(h.perf(PERF_BYTES_B) == static_cast<uint32_t>(exp.bfetch),
         name + ": B byte counter disagrees with fetch cycles");
@@ -287,12 +339,14 @@ static void shape_test(Harness& h, const std::string& name, int M, int Nn, int K
     double occ_compute = slots ? 100.0 * mac_ops / slots : 0.0;
     double occ_overall = 100.0 * mac_ops /
                          (static_cast<double>(got.total()) * N_ARR * N_ARR);
-    std::printf("  %-16s %3dx%3dx%3d  %s  cyc=%5d  [bf %4d wl %3d af %4d cp %4d wb %4d]"
-                "  MACs=%6u  occ: in-compute %5.1f%%  overall %4.1f%%\n",
-                name.c_str(), M, Nn, K, g_failures == before ? "PASS" : "FAIL",
+    std::printf("  %-16s %3dx%3dx%3d %s %s cyc=%5d [bf %4d wl %3d af %4d cp %4d wb %4d]"
+                " MACs=%6u occ %5.1f%%/%4.1f%%\n",
+                name.c_str(), M, Nn, K, os ? "OS" : "WS",
+                g_failures == before ? "PASS" : "FAIL",
                 got.total(), got.bfetch, got.wload, got.afetch, got.compute,
                 got.wb, mac_ops, occ_compute, occ_overall);
   }
+  return got;
 }
 
 static uint32_t g_rng = 0xC0FFEEu;
@@ -376,8 +430,36 @@ int main(int argc, char** argv) {
     h.trace_en = true;
   }
 
-  // ---- Randomized shape sweep ----
-  std::printf("\n-- randomized shapes --\n");
+  // ---- Output-stationary correctness over the same shape space ----
+  std::printf("\n-- output-stationary shapes --\n");
+  {
+    struct Shape { const char* name; int M, N, K; };
+    const Shape shapes[] = {
+      {"os_exact_fit",     4,  4,  4},
+      {"os_multi_m",       8,  4,  4},   // M tiling (OS maps M spatially)
+      {"os_multi_n",       4,  8,  4},
+      {"os_deep_k",        4,  4, 20},   // one clear, no RMW at all
+      {"os_k_chunking",    4,  4, 20},   // K past STREAM_DEPTH
+      {"os_ragged_m",      6,  4,  4},
+      {"os_ragged_n",      4,  6,  4},
+      {"os_ragged_all",    5,  5,  5},
+      {"os_minimal",       1,  1,  1},
+      {"os_thin_row",      1, 10, 13},
+      {"os_thin_col",     20,  1,  1},
+      {"os_spec_example", 37, 10, 13},
+    };
+    for (const auto& s : shapes) {
+      std::vector<int8_t> A, B;
+      fill_random(A, static_cast<size_t>(s.M) * s.K);
+      fill_random(B, static_cast<size_t>(s.K) * s.N);
+      h.trace_en = (s.M * s.N * s.K <= 256);
+      shape_test(h, s.name, s.M, s.N, s.K, A, B, true, FORCE_OS);
+    }
+    h.trace_en = true;
+  }
+
+  // ---- Randomized shape sweep, both dataflows on identical data ----
+  std::printf("\n-- randomized shapes (WS and OS) --\n");
   {
     int before = g_failures;
     const int ITERS = 120;
@@ -389,14 +471,17 @@ int main(int argc, char** argv) {
       std::vector<int8_t> A, B;
       fill_random(A, static_cast<size_t>(M) * K);
       fill_random(B, static_cast<size_t>(K) * Nn);
-      shape_test(h, "rand", M, Nn, K, A, B, /*verbose=*/false);
+      // Both dataflows must produce identical results from identical
+      // inputs; each is independently checked against the golden model.
+      shape_test(h, "rand_ws", M, Nn, K, A, B, false, FORCE_WS);
+      shape_test(h, "rand_os", M, Nn, K, A, B, false, FORCE_OS);
       if (g_failures != before) {
         std::printf("  first failing shape: %dx%dx%d\n", M, Nn, K);
         break;
       }
     }
     h.trace_en = true;
-    std::printf("  %-22s %s  (%d random shapes)\n", "randomized_shapes",
+    std::printf("  %-22s %s  (%d random shapes x 2 dataflows)\n", "randomized_shapes",
                 g_failures == before ? "PASS" : "FAIL", ITERS);
   }
 
@@ -435,7 +520,11 @@ int main(int argc, char** argv) {
   {
     int before = g_failures;
     struct PC { int policy; const char* name; bool err; };
-    const PC cases[] = {{0,"FORCE_WS",false},{1,"FORCE_OS",true},
+    // FORCE_WS and FORCE_OS are both implemented. ADAPTIVE must still
+    // error rather than silently picking one: the scheduler that would
+    // make the choice does not exist yet, and a silent fallback would
+    // corrupt every measurement taken through it.
+    const PC cases[] = {{0,"FORCE_WS",false},{1,"FORCE_OS",false},
                         {2,"ADAPTIVE",true},{3,"RESERVED",true}};
     for (const auto& pc : cases) {
       h.reset();

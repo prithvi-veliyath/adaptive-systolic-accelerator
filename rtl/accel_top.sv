@@ -75,11 +75,12 @@ module accel_top #(
     // counter file; see the PERF_* map below. Counters are cleared when
     // a transaction is accepted, so they always describe the current or
     // most recent run.
-    input  logic [3:0]  perf_addr,
+    input  logic [4:0]  perf_addr,
     output logic [31:0] perf_rdata
 );
 
   localparam logic [1:0] POLICY_FORCE_WS = 2'b00;
+  localparam logic [1:0] POLICY_FORCE_OS = 2'b01;
 
   localparam int DIM_W   = 16;
   localparam int IDX_W   = $clog2(N_ARR);                 // array row/col index
@@ -97,8 +98,13 @@ module accel_top #(
   localparam logic [MCNT_W-1:0]         SD_M    = MCNT_W'(STREAM_DEPTH);
   localparam logic signed [MCAND_W-1:0] M_ZERO  = MCAND_W'(0);
 
-  typedef enum logic [2:0] {
-    S_IDLE, S_BFETCH, S_WLOAD, S_AFETCH, S_COMPUTE, S_WB, S_NEXT, S_DONE
+  // The two dataflows share S_BFETCH, S_AFETCH, S_WB and S_NEXT: the
+  // operand walks and the writeback walk have identical structure in
+  // both, differing only in their extents. Only the phases that touch
+  // the array differ (WS load/compute vs OS clear/compute/drain).
+  typedef enum logic [3:0] {
+    S_IDLE, S_BFETCH, S_WLOAD, S_AFETCH, S_COMPUTE, S_WB, S_NEXT, S_DONE,
+    S_OS_CLEAR, S_OS_COMPUTE, S_OS_DRAIN
   } state_e;
 
   // public_flat_rd is a verification hook only (zero hardware cost): it
@@ -107,40 +113,63 @@ module accel_top #(
   state_e state_n;
 
   // ---- On-chip buffers ----
-  logic signed [DATA_W-1:0] a_buf [STREAM_DEPTH][N_ARR]; // a_buf[mm][kk]
-  logic signed [DATA_W-1:0] b_buf [N_ARR][N_ARR];        // b_buf[kk][nn]
+  // a_buf is written transposed between the two dataflows: WS indexes it
+  // [m][k] because it streams M through a resident weight tile, OS
+  // indexes it [k][m] because it streams K through resident
+  // accumulators. Same storage, same capacity, different access order.
+  logic signed [DATA_W-1:0] a_buf [STREAM_DEPTH][N_ARR];
+  logic signed [DATA_W-1:0] b_buf [STREAM_DEPTH][N_ARR]; // b_buf[kk][nn]
   logic signed [ACC_W-1:0]  c_buf [STREAM_DEPTH][N_ARR]; // c_buf[mm][nn]
 
   // ---- Tile loop origins ----
   logic [DIM_W-1:0] n0, k0, m0;
 
+  // Latched at start: which dataflow this transaction runs.
+  logic mode_os;
+
   // ---- Ragged tile extents, derived combinationally from the origins.
   // Using the true remaining extent (never rounded up to N_ARR) is what
   // makes ragged tiles work without zero-padding: short tiles simply
-  // leave array rows/columns inactive. ----
+  // leave array rows/columns inactive.
+  //
+  // The two dataflows tile the iteration space differently, which is the
+  // whole reason their costs differ:
+  //   WS maps K x N onto the array and streams M, so K and N are bounded
+  //      by N_ARR while M runs up to STREAM_DEPTH per pass.
+  //   OS maps M x N onto the array and streams K, so M and N are bounded
+  //      by N_ARR while K runs up to STREAM_DEPTH per pass.
+  // ----
   logic [DIM_W-1:0]  n_rem, k_rem, m_rem;
-  logic [TCNT_W-1:0] n_tile, k_tile;
-  logic [MCNT_W-1:0] m_chunk;
+  logic [TCNT_W-1:0] n_span;
+  logic [MCNT_W-1:0] k_span, m_span;
 
-  assign n_rem   = cfg_n - n0;
-  assign k_rem   = cfg_k - k0;
-  assign m_rem   = cfg_m - m0;
-  assign n_tile  = (n_rem >= DIM_W'(N_ARR))        ? N_ARR_T : TCNT_W'(n_rem);
-  assign k_tile  = (k_rem >= DIM_W'(N_ARR))        ? N_ARR_T : TCNT_W'(k_rem);
-  assign m_chunk = (m_rem >= DIM_W'(STREAM_DEPTH)) ? SD_M    : MCNT_W'(m_rem);
+  assign n_rem  = cfg_n - n0;
+  assign k_rem  = cfg_k - k0;
+  assign m_rem  = cfg_m - m0;
+  assign n_span = (n_rem >= DIM_W'(N_ARR)) ? N_ARR_T : TCNT_W'(n_rem);
+  assign k_span = mode_os
+                ? ((k_rem >= DIM_W'(STREAM_DEPTH)) ? SD_M : MCNT_W'(k_rem))
+                : ((k_rem >= DIM_W'(N_ARR))        ? MCNT_W'(N_ARR) : MCNT_W'(k_rem));
+  assign m_span = mode_os
+                ? ((m_rem >= DIM_W'(N_ARR))        ? MCNT_W'(N_ARR) : MCNT_W'(m_rem))
+                : ((m_rem >= DIM_W'(STREAM_DEPTH)) ? SD_M : MCNT_W'(m_rem));
 
-  // First K tile writes C directly; every later one read-modify-writes.
-  // No pre-zeroing pass over C is performed.
-  logic k_first;
-  assign k_first = (k0 == '0);
+  // In WS the first K tile writes C directly and every later one
+  // read-modify-writes, because partial sums must leave the array
+  // between K tiles. In OS the accumulator never leaves the array until
+  // the reduction is finished, so C is always a direct write -- that
+  // difference is the central hypothesis this project measures.
+  logic k_first, c_direct;
+  assign k_first  = (k0 == '0);
+  assign c_direct = mode_os | k_first;
 
   // ---- Loop-advance predicates and the next origin values ----
   logic [DIM_W-1:0] m0_nx, k0_nx, n0_nx;
   logic             more_m, more_k, more_n;
 
-  assign m0_nx  = m0 + DIM_W'(m_chunk);
-  assign k0_nx  = k0 + DIM_W'(k_tile);
-  assign n0_nx  = n0 + DIM_W'(n_tile);
+  assign m0_nx  = m0 + DIM_W'(m_span);
+  assign k0_nx  = k0 + DIM_W'(k_span);
+  assign n0_nx  = n0 + DIM_W'(n_span);
   assign more_m = (m0_nx < cfg_m);
   assign more_k = (k0_nx < cfg_k);
   assign more_n = (n0_nx < cfg_n);
@@ -152,36 +181,53 @@ module accel_top #(
   assign addr_a_base = ADDR_W'(m0 * cfg_k + k0);
   assign addr_c_base = ADDR_W'(m0 * cfg_n + n0);
 
-  // ---- B-tile fetch ----
-  logic [IDX_W-1:0]  bf_kk, bf_nn;
+  // ---- B-tile fetch (k_span rows x n_span columns of B) ----
+  // Identical walk in both dataflows; only k_span differs.
+  logic [MIDX_W-1:0] bf_kk;
+  logic [IDX_W-1:0]  bf_nn;
   logic [ADDR_W-1:0] bf_addr;
   logic              bf_active, bf_last;
-  assign bf_last = (bf_kk == IDX_W'(k_tile - TCNT_W'(1))) &&
-                   (bf_nn == IDX_W'(n_tile - TCNT_W'(1)));
+  assign bf_last = (bf_kk == MIDX_W'(k_span - MCNT_W'(1))) &&
+                   (bf_nn == IDX_W'(n_span - TCNT_W'(1)));
 
-  // ---- Weight load ----
+  // ---- Weight load (WS only) ----
   logic [IDX_W-1:0] load_cnt;
   logic             load_last;
-  assign load_last = (load_cnt == IDX_W'(k_tile - TCNT_W'(1)));
+  assign load_last = (load_cnt == IDX_W'(k_span[IDX_W:0] - MCNT_W'(1)));
 
-  // ---- A-chunk fetch ----
+  // ---- A-chunk fetch (m_span rows x k_span columns of A) ----
   logic [MIDX_W-1:0] af_mm;
-  logic [IDX_W-1:0]  af_kk;
+  logic [MIDX_W-1:0] af_kk;
   logic [ADDR_W-1:0] af_addr;
   logic              af_active, af_last;
-  assign af_last = (af_mm == MIDX_W'(m_chunk - MCNT_W'(1))) &&
-                   (af_kk == IDX_W'(k_tile - TCNT_W'(1)));
+  assign af_last = (af_mm == MIDX_W'(m_span - MCNT_W'(1))) &&
+                   (af_kk == MIDX_W'(k_span - MCNT_W'(1)));
 
   // ---- Compute ----
   logic [CCNT_W-1:0] compute_cnt;
   logic [CCNT_W-1:0] compute_last;
   logic [MCNT_W-1:0] col_result_cnt [N_ARR];
-  // Last result (m = m_chunk-1) leaves column n_tile-1 at
-  // compute_cnt = (m_chunk-1) + (n_tile-1) + N_ARR. The psum traverses
-  // all N_ARR physical rows even when k_tile < N_ARR, because inactive
-  // rows still cost one register stage each -- so the drain depth is
-  // N_ARR, not k_tile.
-  assign compute_last = CCNT_W'(m_chunk) + CCNT_W'(n_tile) + CCNT_W'(N_ARR) - CCNT_W'(2);
+  // WS: the last result (m = m_span-1) leaves column n_span-1 at
+  //     compute_cnt = (m_span-1) + (n_span-1) + N_ARR. The psum traverses
+  //     all N_ARR physical rows even when k_span < N_ARR, because
+  //     inactive rows still cost one register stage each -- so the drain
+  //     depth is N_ARR, not k_span.
+  // OS: A[i][t] and B[t][j] meet at PE(i,j) at compute_cnt = t + i + j,
+  //     so the last accumulation is at (k_span-1)+(m_span-1)+(n_span-1).
+  //     No pipeline drain is included here; that is the separate
+  //     S_OS_DRAIN phase.
+  assign compute_last = mode_os
+      ? (CCNT_W'(k_span) + CCNT_W'(m_span) + CCNT_W'(n_span) - CCNT_W'(3))
+      : (CCNT_W'(m_span) + CCNT_W'(n_span) + CCNT_W'(N_ARR) - CCNT_W'(2));
+
+  // ---- OS accumulator drain ----
+  // Always N_ARR cycles: the chain is physically N_ARR wide, so column 0
+  // needs N_ARR shifts to reach the east edge regardless of n_span. On
+  // drain cycle d the east edge presents the accumulator that started in
+  // column N_ARR-1-d.
+  logic [IDX_W-1:0] drain_cnt;
+  logic             drain_last;
+  assign drain_last = (drain_cnt == IDX_W'(N_ARR-1));
 
   // ---- Writeback / read-modify-write ----
   logic [MIDX_W-1:0]      wb_mm;
@@ -189,26 +235,34 @@ module accel_top #(
   logic [ADDR_W-1:0]      wb_addr;
   logic                   wb_active, wb_phase, wb_last_elem, wb_final;
   logic signed [ACC_W-1:0] wb_sum;
-  assign wb_last_elem = (wb_mm == MIDX_W'(m_chunk - MCNT_W'(1))) &&
-                        (wb_nn == IDX_W'(n_tile - TCNT_W'(1)));
+  // The writeback walk covers the output tile: m_span x n_span in both
+  // dataflows.
+  assign wb_last_elem = (wb_mm == MIDX_W'(m_span - MCNT_W'(1))) &&
+                        (wb_nn == IDX_W'(n_span - TCNT_W'(1)));
   // A direct write completes in its single cycle; an RMW completes only
   // after its write half (phase 1). Non-pipelined by design for v1.
-  assign wb_final = k_first ? (wb_phase == 1'b0) : (wb_phase == 1'b1);
+  assign wb_final = c_direct ? (wb_phase == 1'b0) : (wb_phase == 1'b1);
 
   // ---- cfg validation ----
+  logic policy_supported;
+  assign policy_supported = (cfg_policy == POLICY_FORCE_WS) ||
+                            (cfg_policy == POLICY_FORCE_OS);
+
   logic cfg_valid;
   assign cfg_valid = (cfg_m != '0) && (cfg_n != '0) && (cfg_k != '0) &&
                      (cfg_m <= DIM_W'(MAX_DIM)) && (cfg_n <= DIM_W'(MAX_DIM)) &&
                      (cfg_k <= DIM_W'(MAX_K)) &&
-                     (cfg_policy == POLICY_FORCE_WS);
+                     policy_supported;
 
   // ---- Array interconnect ----
   // Phase encoding shared with the PE: 0 idle, 1 WS load, 2 WS compute,
-  // 3 OS clear, 4 OS compute, 5 OS drain. Only the WS phases are driven
-  // until the OS controller lands.
+  // 3 OS clear, 4 OS compute, 5 OS drain.
   logic [2:0] phase;
-  assign phase = (state == S_WLOAD)   ? 3'd1 :
-                 (state == S_COMPUTE) ? 3'd2 : 3'd0;
+  assign phase = (state == S_WLOAD)      ? 3'd1 :
+                 (state == S_COMPUTE)    ? 3'd2 :
+                 (state == S_OS_CLEAR)   ? 3'd3 :
+                 (state == S_OS_COMPUTE) ? 3'd4 :
+                 (state == S_OS_DRAIN)   ? 3'd5 : 3'd0;
 
   localparam int MAC_CNT_W = $clog2(N_ARR*N_ARR + 1);
 
@@ -218,27 +272,14 @@ module accel_top #(
   logic                     operand_valid_in_arr [N_ARR];
   logic signed [ACC_W-1:0]  psum_out_arr       [N_ARR];
   logic                     psum_valid_out_arr [N_ARR];
-  // Consumed by the OS controller; the datapath lands before the
-  // control that drives it so each can be reviewed on its own.
-  /* verilator lint_off UNUSEDSIGNAL */
   logic signed [ACC_W-1:0]  drain_out_arr      [N_ARR];
-  /* verilator lint_on UNUSEDSIGNAL */
   logic [MAC_CNT_W-1:0]     active_macs;
-
-  // OS is not driven yet; the operand-valid inputs stay low so the PEs
-  // can never take an OS accumulation.
-  genvar gv;
-  generate
-    for (gv = 0; gv < N_ARR; gv++) begin : g_op_valid
-      assign operand_valid_in_arr[gv] = 1'b0;
-    end
-  endgenerate
 
   pe_array #(.N_ARR(N_ARR), .DATA_W(DATA_W), .ACC_W(ACC_W)) u_array (
     .clk           (clk),
     .rst_n         (rst_n),
     .phase         (phase),
-    .n_active      (n_tile),
+    .n_active      (n_span),
     .a_in          (a_in_arr),
     .a_valid_in    (a_valid_in_arr),
     .operand_in       (operand_in_arr),
@@ -252,32 +293,61 @@ module accel_top #(
   genvar gr;
   generate
     for (gr = 0; gr < N_ARR; gr++) begin : g_act_feed
-      // Array row r holds reduction index kk = r. Row r presents
-      // A[m0+m][k0+r] at compute_cnt == m + r.
+      // Both dataflows inject activations at the west edge, but index
+      // them differently.
       //
-      // Two independent gates produce ragged-K behavior with no padding:
-      //   - r < k_tile    : rows beyond the true tile height never fire,
-      //                     so they pass psum through untouched
-      //   - 0 <= m < m_chunk : temporal gate for pipeline fill/drain and
-      //                     for a short final M chunk
-      logic signed [MCAND_W-1:0] m_candidate;
-      logic                      row_in_tile;
-      assign m_candidate = $signed({1'b0, compute_cnt}) - $signed(MCAND_W'(gr));
-      assign row_in_tile = (TCNT_W'(gr) < k_tile);
-      assign a_valid_in_arr[gr] = (state == S_COMPUTE) && row_in_tile &&
-                                  (m_candidate >= M_ZERO) &&
-                                  (m_candidate < $signed(MCAND_W'(m_chunk)));
-      assign a_in_arr[gr] = a_valid_in_arr[gr] ?
-                            a_buf[m_candidate[MIDX_W-1:0]][gr] : '0;
+      // WS: array row r holds reduction index k = r, and row r presents
+      //     A[m0+m][k0+r] at compute_cnt == m + r. Ragged-K needs no
+      //     padding because rows at or past k_span never fire and simply
+      //     pass the partial sum through.
+      // OS: array row i holds output row i, and row i presents
+      //     A[m0+i][k0+t] at compute_cnt == t + i. Ragged-M needs no
+      //     padding because rows at or past m_span never fire.
+      logic signed [MCAND_W-1:0] idx_ws, idx_os;
+      logic                      row_ws, row_os, sel_ws, sel_os;
+
+      assign idx_ws = $signed({1'b0, compute_cnt}) - $signed(MCAND_W'(gr));
+      assign idx_os = idx_ws;  // same skew relation, different meaning
+      assign row_ws = (MCNT_W'(gr) < k_span);
+      assign row_os = (MCNT_W'(gr) < m_span);
+
+      assign sel_ws = (state == S_COMPUTE) && row_ws &&
+                      (idx_ws >= M_ZERO) &&
+                      (idx_ws < $signed(MCAND_W'(m_span)));
+      assign sel_os = (state == S_OS_COMPUTE) && row_os &&
+                      (idx_os >= M_ZERO) &&
+                      (idx_os < $signed(MCAND_W'(k_span)));
+
+      assign a_valid_in_arr[gr] = sel_ws || sel_os;
+      // WS reads a_buf[m][k=row]; OS reads a_buf[t][i=row].
+      assign a_in_arr[gr] = sel_ws ? a_buf[idx_ws[MIDX_W-1:0]][gr] :
+                            sel_os ? a_buf[idx_os[MIDX_W-1:0]][gr] : '0;
     end
 
     for (gr = 0; gr < N_ARR; gr++) begin : g_weight_feed
-      // Reverse-row-order injection over the tile's true height: after
-      // k_tile shifts, b_buf[kk] sits in array row kk. Rows at or below
-      // k_tile retain stale weights, which is harmless precisely because
-      // they are never activated -- this is why ragged K needs no
-      // zero-fill of the weight tile.
-      assign operand_in_arr[gr] = b_buf[IDX_W'(k_tile - TCNT_W'(1)) - load_cnt][gr];
+      // WS load: reverse-row-order injection over the tile's true
+      // height, so after k_span shifts b_buf[kk] sits in array row kk.
+      // Rows at or past k_span keep stale weights, harmless precisely
+      // because they are never activated -- this is why ragged K needs
+      // no zero-fill of the weight tile.
+      //
+      // OS compute: the same port streams B[k0+t][n0+j] south into
+      // column j at compute_cnt == t + j, one weight per cycle, so the
+      // activation from the west and the weight from the north meet at
+      // PE(i,j) on the same cycle.
+      logic signed [MCAND_W-1:0] t_os;
+      logic                      col_os, os_stream;
+
+      assign t_os      = $signed({1'b0, compute_cnt}) - $signed(MCAND_W'(gr));
+      assign col_os    = (TCNT_W'(gr) < n_span);
+      assign os_stream = (state == S_OS_COMPUTE) && col_os &&
+                         (t_os >= M_ZERO) &&
+                         (t_os < $signed(MCAND_W'(k_span)));
+
+      assign operand_valid_in_arr[gr] = os_stream;
+      assign operand_in_arr[gr] =
+          os_stream ? b_buf[t_os[MIDX_W-1:0]][gr]
+                    : b_buf[MIDX_W'(k_span - MCNT_W'(1)) - MIDX_W'(load_cnt)][gr];
     end
   endgenerate
 
@@ -285,9 +355,9 @@ module accel_top #(
   generate
     for (gr = 0; gr < N_ARR; gr++) begin : g_capture
       logic col_in_tile, col_capture;
-      assign col_in_tile = (TCNT_W'(gr) < n_tile);
+      assign col_in_tile = (TCNT_W'(gr) < n_span);
       assign col_capture = (state == S_COMPUTE) && psum_valid_out_arr[gr] &&
-                           col_in_tile && (col_result_cnt[gr] < m_chunk);
+                           col_in_tile && (col_result_cnt[gr] < m_span);
 
       // Re-armed on every entry to COMPUTE, not just at reset: this
       // counter is the per-tile result index, so it must restart for
@@ -317,18 +387,58 @@ module accel_top #(
     end
   endgenerate
 
+  // ---- OS drain capture ----
+  // On drain cycle d the east edge of row r presents the accumulator
+  // that started in column N_ARR-1-d, so results arrive in reverse
+  // column order. Columns at or past n_span were cleared and never
+  // accumulated; they are captured harmlessly and simply not written
+  // back.
+  logic [IDX_W-1:0] drain_col;
+  assign drain_col = IDX_W'(N_ARR-1) - drain_cnt;
+
+  generate
+    for (gr = 0; gr < N_ARR; gr++) begin : g_drain_capture
+      always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+          // c_buf is fully rewritten before each writeback; no reset
+          // value is needed or useful here.
+        end else if (state == S_OS_DRAIN && (MCNT_W'(gr) < m_span)) begin
+          c_buf[MIDX_W'(gr)][drain_col] <= drain_out_arr[gr];
+        end
+      end
+    end
+  endgenerate
+
   // ---- Main FSM ----
   always_comb begin
     state_n = state;
     unique case (state)
-      S_IDLE:    if (start && cfg_valid)              state_n = S_BFETCH;
-      S_BFETCH:  if (bf_active && bf_last)            state_n = S_WLOAD;
+      S_IDLE: if (start && cfg_valid)
+                state_n = (cfg_policy == POLICY_FORCE_OS) ? S_OS_CLEAR : S_BFETCH;
+
+      // Shared operand fetch: the next state depends only on the mode.
+      S_BFETCH:  if (bf_active && bf_last)
+                   state_n = mode_os ? S_AFETCH : S_WLOAD;
       S_WLOAD:   if (load_last)                       state_n = S_AFETCH;
-      S_AFETCH:  if (af_active && af_last)            state_n = S_COMPUTE;
+      S_AFETCH:  if (af_active && af_last)
+                   state_n = mode_os ? S_OS_COMPUTE : S_COMPUTE;
+
       S_COMPUTE: if (compute_cnt == compute_last)     state_n = S_WB;
+
+      // OS keeps the accumulators resident across K chunks: another
+      // chunk means going straight back for operands with no clear and
+      // no drain, which is exactly why OS never spills partial sums.
+      S_OS_CLEAR:   state_n = S_BFETCH;
+      S_OS_COMPUTE: if (compute_cnt == compute_last)
+                      state_n = more_k ? S_BFETCH : S_OS_DRAIN;
+      S_OS_DRAIN:   if (drain_last)                   state_n = S_WB;
+
       S_WB:      if (wb_active && wb_last_elem && wb_final) state_n = S_NEXT;
-      S_NEXT:    state_n = more_m ? S_AFETCH :
-                           (more_k || more_n) ? S_BFETCH : S_DONE;
+
+      S_NEXT:    state_n = mode_os
+                   ? ((more_n || more_m) ? S_OS_CLEAR : S_DONE)
+                   : (more_m ? S_AFETCH :
+                      (more_k || more_n) ? S_BFETCH : S_DONE);
       S_DONE:    state_n = S_IDLE;
       default:   state_n = S_IDLE;
     endcase
@@ -356,6 +466,8 @@ module accel_top #(
       wb_phase    <= 1'b0;
       wb_sum      <= '0;
       wb_active   <= 1'b0;
+      drain_cnt   <= '0;
+      mode_os     <= 1'b0;
       error       <= 1'b0;
     end else begin
       state <= state_n;
@@ -367,6 +479,10 @@ module accel_top #(
           k0 <= '0;
           m0 <= '0;
           if (start && cfg_valid) begin
+            // Latch the dataflow for the whole transaction. Every span
+            // and every state transition keys off this, so it must not
+            // move once a run is under way.
+            mode_os   <= (cfg_policy == POLICY_FORCE_OS);
             // First tile is (n0,k0) = (0,0), so its B base address is 0.
             bf_kk     <= '0;
             bf_nn     <= '0;
@@ -374,6 +490,15 @@ module accel_top #(
             bf_active <= 1'b1;
           end
           if (start && !cfg_valid) error <= 1'b1;
+        end
+
+        // OS zeroes every accumulator once per output tile, then falls
+        // through to the shared operand fetch.
+        S_OS_CLEAR: begin
+          bf_kk     <= '0;
+          bf_nn     <= '0;
+          bf_addr   <= ADDR_W'(k0 * cfg_n + n0);
+          bf_active <= 1'b1;
         end
 
         // Walk the B tile in row-major order. As in every fetch phase
@@ -384,15 +509,23 @@ module accel_top #(
         S_BFETCH: begin
           if (bf_active) begin
             b_buf[bf_kk][bf_nn] <= mem_b_rdata;
-            if (bf_nn == IDX_W'(n_tile - TCNT_W'(1))) begin
+            if (bf_nn == IDX_W'(n_span - TCNT_W'(1))) begin
               bf_nn   <= '0;
               // Skip to the same column origin on the next B row.
-              bf_addr <= bf_addr + ADDR_W'(cfg_n) - ADDR_W'(n_tile) + ADDR_W'(1);
+              bf_addr <= bf_addr + ADDR_W'(cfg_n) - ADDR_W'(n_span) + ADDR_W'(1);
               if (bf_last) bf_active <= 1'b0;
               else         bf_kk     <= bf_kk + 1'b1;
             end else begin
               bf_nn   <= bf_nn + 1'b1;
               bf_addr <= bf_addr + ADDR_W'(1);
+            end
+            // OS skips the weight load and goes straight to A, so set
+            // up the A walk as the B walk finishes.
+            if (bf_last && mode_os) begin
+              af_mm     <= '0;
+              af_kk     <= '0;
+              af_addr   <= addr_a_base;
+              af_active <= 1'b1;
             end
           end
           load_cnt <= '0;
@@ -412,11 +545,16 @@ module accel_top #(
 
         S_AFETCH: begin
           if (af_active) begin
-            a_buf[af_mm][af_kk] <= mem_a_rdata;
-            if (af_kk == IDX_W'(k_tile - TCNT_W'(1))) begin
+            // WS stores A as [m][k]; OS stores it transposed as [k][m],
+            // because OS streams the reduction index through the array
+            // while WS streams the output-row index.
+            if (mode_os) a_buf[af_kk][af_mm[IDX_W-1:0]] <= mem_a_rdata;
+            else         a_buf[af_mm][af_kk[IDX_W-1:0]] <= mem_a_rdata;
+
+            if (af_kk == MIDX_W'(k_span - MCNT_W'(1))) begin
               af_kk   <= '0;
               // Next A row: advance by K, back to this tile's k origin.
-              af_addr <= af_addr + ADDR_W'(cfg_k) - ADDR_W'(k_tile) + ADDR_W'(1);
+              af_addr <= af_addr + ADDR_W'(cfg_k) - ADDR_W'(k_span) + ADDR_W'(1);
               if (af_last) af_active <= 1'b0;
               else         af_mm     <= af_mm + 1'b1;
             end else begin
@@ -438,18 +576,47 @@ module accel_top #(
           end
         end
 
+        S_OS_COMPUTE: begin
+          compute_cnt <= compute_cnt + 1'b1;
+          if (compute_cnt == compute_last) begin
+            drain_cnt <= '0;
+            if (more_k) begin
+              // Another K chunk for the same output tile. The
+              // accumulators stay exactly where they are -- no clear,
+              // no drain, no C traffic. This is the property that makes
+              // OS cheap for deep reductions.
+              k0        <= k0_nx;
+              bf_kk     <= '0;
+              bf_nn     <= '0;
+              bf_addr   <= ADDR_W'(k0_nx * cfg_n + n0);
+              bf_active <= 1'b1;
+            end
+          end
+        end
+
+        S_OS_DRAIN: begin
+          if (!drain_last) drain_cnt <= drain_cnt + 1'b1;
+          if (drain_last) begin
+            wb_mm     <= '0;
+            wb_nn     <= '0;
+            wb_phase  <= 1'b0;
+            wb_addr   <= addr_c_base;
+            wb_active <= 1'b1;
+          end
+        end
+
         S_WB: begin
           if (wb_active) begin
-            if (!k_first && (wb_phase == 1'b0)) begin
+            if (!c_direct && (wb_phase == 1'b0)) begin
               // Read half: mem_c_rdata at this edge answers the read
               // issued during the cycle now ending.
               wb_sum   <= mem_c_rdata + c_buf[wb_mm][wb_nn];
               wb_phase <= 1'b1;
             end else begin
               wb_phase <= 1'b0;
-              if (wb_nn == IDX_W'(n_tile - TCNT_W'(1))) begin
+              if (wb_nn == IDX_W'(n_span - TCNT_W'(1))) begin
                 wb_nn   <= '0;
-                wb_addr <= wb_addr + ADDR_W'(cfg_n) - ADDR_W'(n_tile) + ADDR_W'(1);
+                wb_addr <= wb_addr + ADDR_W'(cfg_n) - ADDR_W'(n_span) + ADDR_W'(1);
                 if (wb_last_elem) wb_active <= 1'b0;
                 else              wb_mm     <= wb_mm + 1'b1;
               end else begin
@@ -460,7 +627,17 @@ module accel_top #(
           end
         end
 
-        S_NEXT: begin
+        S_NEXT: if (mode_os) begin
+          // OS advances the output tile only; K always restarts, since
+          // the whole reduction completed inside the array.
+          k0 <= '0;
+          if (more_n) begin
+            n0 <= n0_nx;
+          end else begin
+            n0 <= '0;
+            m0 <= m0_nx;
+          end
+        end else begin
           if (more_m) begin
             // Weights stay resident: straight back to the A fetch with
             // no B refetch and no weight reload.
@@ -501,10 +678,10 @@ module accel_top #(
   assign mem_b_rd_en = (state == S_BFETCH) && bf_active;
 
   assign mem_c_addr  = wb_addr;
-  assign mem_c_rd_en = (state == S_WB) && wb_active && !k_first && (wb_phase == 1'b0);
-  assign mem_c_wdata = k_first ? c_buf[wb_mm][wb_nn] : wb_sum;
+  assign mem_c_rd_en = (state == S_WB) && wb_active && !c_direct && (wb_phase == 1'b0);
+  assign mem_c_wdata = c_direct ? c_buf[wb_mm][wb_nn] : wb_sum;
   assign mem_c_wr_en = (state == S_WB) && wb_active &&
-                       (k_first ? (wb_phase == 1'b0) : (wb_phase == 1'b1));
+                       (c_direct ? (wb_phase == 1'b0) : (wb_phase == 1'b1));
 
   // ---- Performance counters ----
   //
@@ -516,19 +693,21 @@ module accel_top #(
   //
   // Cleared on each accepted start, so a read after `done` describes
   // exactly the run that just finished.
-  localparam logic [3:0]
-      PERF_TOTAL_CYCLES = 4'd0,  PERF_COMPUTE_CYCLES = 4'd1,
-      PERF_BFETCH       = 4'd2,  PERF_WLOAD          = 4'd3,
-      PERF_AFETCH       = 4'd4,  PERF_WB             = 4'd5,
-      PERF_STALL        = 4'd6,  PERF_WEIGHT_TILES   = 4'd7,
-      PERF_M_CHUNKS     = 4'd8,  PERF_MAC_OPS        = 4'd9,
-      PERF_MAC_SLOTS    = 4'd10, PERF_BYTES_A        = 4'd11,
-      PERF_BYTES_B      = 4'd12, PERF_C_WRITES       = 4'd13,
-      PERF_C_RMW        = 4'd14, PERF_ERRORS         = 4'd15;
+  localparam logic [4:0]
+      PERF_TOTAL_CYCLES = 5'd0,  PERF_COMPUTE_CYCLES = 5'd1,
+      PERF_BFETCH       = 5'd2,  PERF_WLOAD          = 5'd3,
+      PERF_AFETCH       = 5'd4,  PERF_WB             = 5'd5,
+      PERF_STALL        = 5'd6,  PERF_WEIGHT_TILES   = 5'd7,
+      PERF_M_CHUNKS     = 5'd8,  PERF_MAC_OPS        = 5'd9,
+      PERF_MAC_SLOTS    = 5'd10, PERF_BYTES_A        = 5'd11,
+      PERF_BYTES_B      = 5'd12, PERF_C_WRITES       = 5'd13,
+      PERF_C_RMW        = 5'd14, PERF_ERRORS         = 5'd15,
+      PERF_OS_CLEAR     = 5'd16, PERF_OS_DRAIN       = 5'd17;
 
   logic [31:0] cnt_total, cnt_compute, cnt_bfetch, cnt_wload, cnt_afetch;
   logic [31:0] cnt_wb, cnt_weight_tiles, cnt_m_chunks, cnt_mac;
   logic [31:0] cnt_bytes_a, cnt_bytes_b, cnt_c_writes, cnt_c_rmw, cnt_errors;
+  logic [31:0] cnt_os_clear, cnt_os_drain;
 
   logic perf_clear;
   assign perf_clear = (state == S_IDLE) && start && cfg_valid;
@@ -540,6 +719,7 @@ module accel_top #(
       cnt_weight_tiles <= '0; cnt_m_chunks <= '0; cnt_mac      <= '0;
       cnt_bytes_a      <= '0; cnt_bytes_b  <= '0; cnt_c_writes <= '0;
       cnt_c_rmw        <= '0; cnt_errors   <= '0;
+      cnt_os_clear     <= '0; cnt_os_drain <= '0;
     end else if (perf_clear) begin
       // A new transaction resets everything except the error count,
       // which is a lifetime tally and deliberately survives.
@@ -548,6 +728,7 @@ module accel_top #(
       cnt_weight_tiles <= '0; cnt_m_chunks <= '0; cnt_mac      <= '0;
       cnt_bytes_a      <= '0; cnt_bytes_b  <= '0; cnt_c_writes <= '0;
       cnt_c_rmw        <= '0;
+      cnt_os_clear     <= '0; cnt_os_drain <= '0;
     end else begin
       if (busy) cnt_total <= cnt_total + 32'd1;
 
@@ -565,10 +746,16 @@ module accel_top #(
           cnt_afetch <= cnt_afetch + 32'd1;
           if (af_active) cnt_bytes_a <= cnt_bytes_a + 32'd1;
         end
-        S_COMPUTE: begin
+        // Both dataflows report compute occupancy and MACs through the
+        // same counters, so the two are directly comparable. Clear and
+        // drain are OS-only overhead and are counted separately as
+        // stall, not as compute.
+        S_COMPUTE, S_OS_COMPUTE: begin
           cnt_compute <= cnt_compute + 32'd1;
           cnt_mac     <= cnt_mac + 32'(active_macs);
         end
+        S_OS_CLEAR:  cnt_os_clear <= cnt_os_clear + 32'd1;
+        S_OS_DRAIN:  cnt_os_drain <= cnt_os_drain + 32'd1;
         S_WB:   cnt_wb <= cnt_wb + 32'd1;
         S_NEXT: cnt_m_chunks <= cnt_m_chunks + 32'd1;
         S_IDLE: if (start && !cfg_valid) cnt_errors <= cnt_errors + 32'd1;
@@ -591,7 +778,11 @@ module accel_top #(
       PERF_WLOAD:          perf_rdata = cnt_wload;
       PERF_AFETCH:         perf_rdata = cnt_afetch;
       PERF_WB:             perf_rdata = cnt_wb;
+      // Everything the array is not computing: fetch, load, writeback,
+      // and (OS only) clear and drain.
       PERF_STALL:          perf_rdata = cnt_total - cnt_compute;
+      PERF_OS_CLEAR:       perf_rdata = cnt_os_clear;
+      PERF_OS_DRAIN:       perf_rdata = cnt_os_drain;
       PERF_WEIGHT_TILES:   perf_rdata = cnt_weight_tiles;
       PERF_M_CHUNKS:       perf_rdata = cnt_m_chunks;
       PERF_MAC_OPS:        perf_rdata = cnt_mac;
@@ -615,11 +806,13 @@ module accel_top #(
   assert property (p_macs_bounded)
     else $error("active_macs exceeds the number of PEs");
 
-  // ...and must report none at all outside COMPUTE, which is what makes
-  // the MAC total trustworthy as a measure of real work.
+  // ...and must report none at all outside a compute phase, which is
+  // what makes the MAC total trustworthy as a measure of real work.
+  // Both dataflows have a compute state and both feed the same counter.
   property p_no_macs_outside_compute;
     @(posedge clk) disable iff (!rst_n)
-      (state != S_COMPUTE) |-> (active_macs == MAC_CNT_W'(0));
+      ((state != S_COMPUTE) && (state != S_OS_COMPUTE))
+        |-> (active_macs == MAC_CNT_W'(0));
   endproperty
   assert property (p_no_macs_outside_compute)
     else $error("active_macs asserted outside COMPUTE");
@@ -635,10 +828,31 @@ module accel_top #(
   // The first K tile must never read C back -- there is no pre-zeroing
   // pass, so a read there would consume undefined memory.
   property p_no_rmw_on_first_k;
-    @(posedge clk) disable iff (!rst_n) (k_first |-> !mem_c_rd_en);
+    @(posedge clk) disable iff (!rst_n) (c_direct |-> !mem_c_rd_en);
   endproperty
   assert property (p_no_rmw_on_first_k)
-    else $error("read-modify-write attempted on the first K tile");
+    else $error("read-modify-write attempted on a direct-write tile");
+
+  // Output-stationary must never read C back at all: the entire
+  // reduction happens inside the array, so a C read would mean a
+  // partial sum escaped. This is the invariant the whole WS-vs-OS
+  // comparison rests on.
+  property p_os_never_reads_c;
+    @(posedge clk) disable iff (!rst_n) (mode_os |-> !mem_c_rd_en);
+  endproperty
+  assert property (p_os_never_reads_c)
+    else $error("OS issued a C read; accumulator escaped the array");
+
+  // The dataflow must not change while a transaction is in flight.
+  // Both cycles must be busy: mode_os is latched on the very edge that
+  // raises busy, so requiring stability on the first busy cycle would
+  // flag that legitimate latch.
+  property p_mode_stable_while_busy;
+    @(posedge clk) disable iff (!rst_n)
+      (busy && $past(busy)) |-> $stable(mode_os);
+  endproperty
+  assert property (p_mode_stable_while_busy)
+    else $error("dataflow mode changed mid-transaction");
 
   // Weights must stay resident while M chunks stream: no weight load may
   // occur between a compute and the next compute of the same tile.
@@ -649,15 +863,26 @@ module accel_top #(
   assert property (p_no_reload_within_m_loop)
     else $error("weights reloaded while streaming M chunks of the same tile");
 
-  // Tile extents must always be within the physical array.
+  // Spans must always be non-zero, within STREAM_DEPTH, and -- for
+  // whichever dimensions that dataflow maps spatially -- within the
+  // physical array.
   property p_tile_extents_legal;
     @(posedge clk) disable iff (!rst_n)
-      busy |-> (k_tile >= TCNT_W'(1)) && (k_tile <= N_ARR_T) &&
-               (n_tile >= TCNT_W'(1)) && (n_tile <= N_ARR_T) &&
-               (m_chunk >= MCNT_W'(1)) && (m_chunk <= SD_M);
+      busy |-> (n_span >= TCNT_W'(1)) && (n_span <= N_ARR_T) &&
+               (k_span >= MCNT_W'(1)) && (k_span <= SD_M) &&
+               (m_span >= MCNT_W'(1)) && (m_span <= SD_M);
   endproperty
   assert property (p_tile_extents_legal)
     else $error("illegal tile extent");
+
+  // The dimension each dataflow maps onto the array must fit in it:
+  // WS maps K x N, OS maps M x N.
+  property p_spatial_span_fits;
+    @(posedge clk) disable iff (!rst_n)
+      busy |-> (mode_os ? (m_span <= MCNT_W'(N_ARR)) : (k_span <= MCNT_W'(N_ARR)));
+  endproperty
+  assert property (p_spatial_span_fits)
+    else $error("spatially-mapped span exceeds the array");
 
   property p_busy_not_with_done;
     @(posedge clk) disable iff (!rst_n) !(busy && done);
