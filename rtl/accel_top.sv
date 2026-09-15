@@ -69,7 +69,14 @@ module accel_top #(
     input  logic                    mem_c_rvalid,
     /* verilator lint_on UNUSEDSIGNAL */
     output logic signed [ACC_W-1:0] mem_c_wdata,
-    output logic                    mem_c_wr_en
+    output logic                    mem_c_wr_en,
+
+    // Performance counter read port. Combinational read of a small
+    // counter file; see the PERF_* map below. Counters are cleared when
+    // a transaction is accepted, so they always describe the current or
+    // most recent run.
+    input  logic [3:0]  perf_addr,
+    output logic [31:0] perf_rdata
 );
 
   localparam logic [1:0] POLICY_FORCE_WS = 2'b00;
@@ -200,11 +207,14 @@ module accel_top #(
   assign phase = (state == S_WLOAD)   ? 2'd1 :
                  (state == S_COMPUTE) ? 2'd2 : 2'd0;
 
+  localparam int MAC_CNT_W = $clog2(N_ARR*N_ARR + 1);
+
   logic signed [DATA_W-1:0] a_in_arr       [N_ARR];
   logic                     a_valid_in_arr [N_ARR];
   logic signed [DATA_W-1:0] operand_in_arr [N_ARR];
   logic signed [ACC_W-1:0]  psum_out_arr       [N_ARR];
   logic                     psum_valid_out_arr [N_ARR];
+  logic [MAC_CNT_W-1:0]     active_macs;
 
   pe_array #(.N_ARR(N_ARR), .DATA_W(DATA_W), .ACC_W(ACC_W)) u_array (
     .clk           (clk),
@@ -214,7 +224,8 @@ module accel_top #(
     .a_valid_in    (a_valid_in_arr),
     .operand_in    (operand_in_arr),
     .psum_out      (psum_out_arr),
-    .psum_valid_out(psum_valid_out_arr)
+    .psum_valid_out(psum_valid_out_arr),
+    .active_macs   (active_macs)
   );
 
   genvar gr;
@@ -474,7 +485,123 @@ module accel_top #(
   assign mem_c_wr_en = (state == S_WB) && wb_active &&
                        (k_first ? (wb_phase == 1'b0) : (wb_phase == 1'b1));
 
+  // ---- Performance counters ----
+  //
+  // The accelerator reports its own behavior rather than relying on
+  // external waveform analysis. Everything here is measured from actual
+  // hardware activity (state occupancy, bus enables, the array's own
+  // valid popcount), never predicted from the schedule -- otherwise the
+  // counters would just restate the model they exist to check.
+  //
+  // Cleared on each accepted start, so a read after `done` describes
+  // exactly the run that just finished.
+  localparam logic [3:0]
+      PERF_TOTAL_CYCLES = 4'd0,  PERF_COMPUTE_CYCLES = 4'd1,
+      PERF_BFETCH       = 4'd2,  PERF_WLOAD          = 4'd3,
+      PERF_AFETCH       = 4'd4,  PERF_WB             = 4'd5,
+      PERF_STALL        = 4'd6,  PERF_WEIGHT_TILES   = 4'd7,
+      PERF_M_CHUNKS     = 4'd8,  PERF_MAC_OPS        = 4'd9,
+      PERF_MAC_SLOTS    = 4'd10, PERF_BYTES_A        = 4'd11,
+      PERF_BYTES_B      = 4'd12, PERF_C_WRITES       = 4'd13,
+      PERF_C_RMW        = 4'd14, PERF_ERRORS         = 4'd15;
+
+  logic [31:0] cnt_total, cnt_compute, cnt_bfetch, cnt_wload, cnt_afetch;
+  logic [31:0] cnt_wb, cnt_weight_tiles, cnt_m_chunks, cnt_mac;
+  logic [31:0] cnt_bytes_a, cnt_bytes_b, cnt_c_writes, cnt_c_rmw, cnt_errors;
+
+  logic perf_clear;
+  assign perf_clear = (state == S_IDLE) && start && cfg_valid;
+
+  always_ff @(posedge clk or negedge rst_n) begin
+    if (!rst_n) begin
+      cnt_total        <= '0; cnt_compute  <= '0; cnt_bfetch   <= '0;
+      cnt_wload        <= '0; cnt_afetch   <= '0; cnt_wb       <= '0;
+      cnt_weight_tiles <= '0; cnt_m_chunks <= '0; cnt_mac      <= '0;
+      cnt_bytes_a      <= '0; cnt_bytes_b  <= '0; cnt_c_writes <= '0;
+      cnt_c_rmw        <= '0; cnt_errors   <= '0;
+    end else if (perf_clear) begin
+      // A new transaction resets everything except the error count,
+      // which is a lifetime tally and deliberately survives.
+      cnt_total        <= '0; cnt_compute  <= '0; cnt_bfetch   <= '0;
+      cnt_wload        <= '0; cnt_afetch   <= '0; cnt_wb       <= '0;
+      cnt_weight_tiles <= '0; cnt_m_chunks <= '0; cnt_mac      <= '0;
+      cnt_bytes_a      <= '0; cnt_bytes_b  <= '0; cnt_c_writes <= '0;
+      cnt_c_rmw        <= '0;
+    end else begin
+      if (busy) cnt_total <= cnt_total + 32'd1;
+
+      unique case (state)
+        S_BFETCH: begin
+          cnt_bfetch <= cnt_bfetch + 32'd1;
+          // One B element lands per active fetch cycle.
+          if (bf_active) cnt_bytes_b <= cnt_bytes_b + 32'd1;
+        end
+        S_WLOAD: begin
+          cnt_wload <= cnt_wload + 32'd1;
+          if (load_last) cnt_weight_tiles <= cnt_weight_tiles + 32'd1;
+        end
+        S_AFETCH: begin
+          cnt_afetch <= cnt_afetch + 32'd1;
+          if (af_active) cnt_bytes_a <= cnt_bytes_a + 32'd1;
+        end
+        S_COMPUTE: begin
+          cnt_compute <= cnt_compute + 32'd1;
+          cnt_mac     <= cnt_mac + 32'(active_macs);
+        end
+        S_WB:   cnt_wb <= cnt_wb + 32'd1;
+        S_NEXT: cnt_m_chunks <= cnt_m_chunks + 32'd1;
+        S_IDLE: if (start && !cfg_valid) cnt_errors <= cnt_errors + 32'd1;
+        default: ;
+      endcase
+
+      if (mem_c_wr_en) cnt_c_writes <= cnt_c_writes + 32'd1;
+      if (mem_c_rd_en) cnt_c_rmw    <= cnt_c_rmw + 32'd1;
+    end
+  end
+
+  // MAC slots = compute cycles x array size. mac_ops/mac_slots is the
+  // array's true occupancy while computing; mac_ops/(total x size) is
+  // its occupancy over the whole transaction.
+  always_comb begin
+    unique case (perf_addr)
+      PERF_TOTAL_CYCLES:   perf_rdata = cnt_total;
+      PERF_COMPUTE_CYCLES: perf_rdata = cnt_compute;
+      PERF_BFETCH:         perf_rdata = cnt_bfetch;
+      PERF_WLOAD:          perf_rdata = cnt_wload;
+      PERF_AFETCH:         perf_rdata = cnt_afetch;
+      PERF_WB:             perf_rdata = cnt_wb;
+      PERF_STALL:          perf_rdata = cnt_total - cnt_compute;
+      PERF_WEIGHT_TILES:   perf_rdata = cnt_weight_tiles;
+      PERF_M_CHUNKS:       perf_rdata = cnt_m_chunks;
+      PERF_MAC_OPS:        perf_rdata = cnt_mac;
+      PERF_MAC_SLOTS:      perf_rdata = cnt_compute * 32'(N_ARR*N_ARR);
+      PERF_BYTES_A:        perf_rdata = cnt_bytes_a;
+      PERF_BYTES_B:        perf_rdata = cnt_bytes_b;
+      PERF_C_WRITES:       perf_rdata = cnt_c_writes;
+      PERF_C_RMW:          perf_rdata = cnt_c_rmw;
+      PERF_ERRORS:         perf_rdata = cnt_errors;
+      default:             perf_rdata = 32'd0;
+    endcase
+  end
+
   // ---- Architectural invariants ----
+
+  // The array may never report more concurrent MACs than it has PEs.
+  property p_macs_bounded;
+    @(posedge clk) disable iff (!rst_n)
+      active_macs <= MAC_CNT_W'(N_ARR*N_ARR);
+  endproperty
+  assert property (p_macs_bounded)
+    else $error("active_macs exceeds the number of PEs");
+
+  // ...and must report none at all outside COMPUTE, which is what makes
+  // the MAC total trustworthy as a measure of real work.
+  property p_no_macs_outside_compute;
+    @(posedge clk) disable iff (!rst_n)
+      (state != S_COMPUTE) |-> (active_macs == MAC_CNT_W'(0));
+  endproperty
+  assert property (p_no_macs_outside_compute)
+    else $error("active_macs asserted outside COMPUTE");
 
   // A C read and a C write must never be requested in the same cycle:
   // the v1 RMW path is deliberately non-pipelined.

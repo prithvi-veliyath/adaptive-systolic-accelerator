@@ -1,8 +1,9 @@
-// N_ARR x N_ARR weight-stationary mesh (Milestone 1).
+// N_ARR x N_ARR weight-stationary mesh.
 module pe_array #(
     parameter int N_ARR  = 4,
     parameter int DATA_W = 8,
-    parameter int ACC_W  = 32
+    parameter int ACC_W  = 32,
+    localparam int MAC_CNT_W = $clog2(N_ARR*N_ARR + 1)
 ) (
     input  logic clk,
     input  logic rst_n,
@@ -13,7 +14,13 @@ module pe_array #(
     input  logic signed [DATA_W-1:0] operand_in [N_ARR],
 
     output logic signed [ACC_W-1:0] psum_out       [N_ARR],
-    output logic                    psum_valid_out [N_ARR]
+    output logic                    psum_valid_out [N_ARR],
+
+    // Number of PEs performing a real multiply-accumulate this cycle.
+    // Measured from the array's own valid inputs rather than predicted
+    // from the schedule, so the utilization figure it feeds reflects
+    // what the hardware actually did.
+    output logic [MAC_CNT_W-1:0] active_macs
 );
 
   logic signed [DATA_W-1:0] a_wire         [N_ARR][N_ARR+1];
@@ -77,5 +84,22 @@ module pe_array #(
       assign psum_valid_out[c] = psum_valid_wire[N_ARR][c];
     end
   endgenerate
+
+  // Popcount of the array's activation-valid inputs, qualified by the
+  // COMPUTE phase.
+  //
+  // Both terms are required. A PE accumulates only when its own valid
+  // is asserted AND the array is in COMPUTE -- outside COMPUTE psum_reg
+  // does not update at all, so no MAC occurs even though the activation
+  // valid registers still hold their last values for one cycle until
+  // the inter-tile flush clears them. Counting those would overstate
+  // real work during every tile changeover.
+  always_comb begin
+    active_macs = '0;
+    if (phase == 2'd2)
+      for (int rr = 0; rr < N_ARR; rr++)
+        for (int cc = 0; cc < N_ARR; cc++)
+          if (a_valid_wire[rr][cc]) active_macs = active_macs + MAC_CNT_W'(1);
+  end
 
 endmodule
