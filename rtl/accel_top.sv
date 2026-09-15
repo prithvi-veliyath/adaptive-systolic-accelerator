@@ -203,18 +203,36 @@ module accel_top #(
                      (cfg_policy == POLICY_FORCE_WS);
 
   // ---- Array interconnect ----
-  logic [1:0] phase;
-  assign phase = (state == S_WLOAD)   ? 2'd1 :
-                 (state == S_COMPUTE) ? 2'd2 : 2'd0;
+  // Phase encoding shared with the PE: 0 idle, 1 WS load, 2 WS compute,
+  // 3 OS clear, 4 OS compute, 5 OS drain. Only the WS phases are driven
+  // until the OS controller lands.
+  logic [2:0] phase;
+  assign phase = (state == S_WLOAD)   ? 3'd1 :
+                 (state == S_COMPUTE) ? 3'd2 : 3'd0;
 
   localparam int MAC_CNT_W = $clog2(N_ARR*N_ARR + 1);
 
   logic signed [DATA_W-1:0] a_in_arr       [N_ARR];
   logic                     a_valid_in_arr [N_ARR];
-  logic signed [DATA_W-1:0] operand_in_arr [N_ARR];
+  logic signed [DATA_W-1:0] operand_in_arr       [N_ARR];
+  logic                     operand_valid_in_arr [N_ARR];
   logic signed [ACC_W-1:0]  psum_out_arr       [N_ARR];
   logic                     psum_valid_out_arr [N_ARR];
+  // Consumed by the OS controller; the datapath lands before the
+  // control that drives it so each can be reviewed on its own.
+  /* verilator lint_off UNUSEDSIGNAL */
+  logic signed [ACC_W-1:0]  drain_out_arr      [N_ARR];
+  /* verilator lint_on UNUSEDSIGNAL */
   logic [MAC_CNT_W-1:0]     active_macs;
+
+  // OS is not driven yet; the operand-valid inputs stay low so the PEs
+  // can never take an OS accumulation.
+  genvar gv;
+  generate
+    for (gv = 0; gv < N_ARR; gv++) begin : g_op_valid
+      assign operand_valid_in_arr[gv] = 1'b0;
+    end
+  endgenerate
 
   pe_array #(.N_ARR(N_ARR), .DATA_W(DATA_W), .ACC_W(ACC_W)) u_array (
     .clk           (clk),
@@ -223,9 +241,11 @@ module accel_top #(
     .n_active      (n_tile),
     .a_in          (a_in_arr),
     .a_valid_in    (a_valid_in_arr),
-    .operand_in    (operand_in_arr),
+    .operand_in       (operand_in_arr),
+    .operand_valid_in (operand_valid_in_arr),
     .psum_out      (psum_out_arr),
     .psum_valid_out(psum_valid_out_arr),
+    .drain_out     (drain_out_arr),
     .active_macs   (active_macs)
   );
 

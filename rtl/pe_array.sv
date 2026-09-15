@@ -8,7 +8,7 @@ module pe_array #(
 ) (
     input  logic clk,
     input  logic rst_n,
-    input  logic [1:0] phase,
+    input  logic [2:0] phase,
 
     // Width of the current output tile. Columns at or beyond this index
     // hold weights from a previous tile and must not be allowed to
@@ -18,9 +18,14 @@ module pe_array #(
     input  logic signed [DATA_W-1:0] a_in       [N_ARR],
     input  logic                     a_valid_in [N_ARR],
     input  logic signed [DATA_W-1:0] operand_in [N_ARR],
+    input  logic                     operand_valid_in [N_ARR],
 
     output logic signed [ACC_W-1:0] psum_out       [N_ARR],
     output logic                    psum_valid_out [N_ARR],
+
+    // OS drain: one accumulator per row leaves the east edge each cycle
+    // of the drain phase.
+    output logic signed [ACC_W-1:0] drain_out [N_ARR],
 
     // Number of PEs performing a real multiply-accumulate this cycle.
     // Measured from the array's own valid inputs rather than predicted
@@ -33,18 +38,24 @@ module pe_array #(
   logic                     a_valid_wire   [N_ARR][N_ARR+1];
   logic                     a_valid_gated  [N_ARR][N_ARR];
   logic signed [DATA_W-1:0] op_wire        [N_ARR+1][N_ARR];
+  logic                     op_valid_wire  [N_ARR+1][N_ARR];
   logic signed [ACC_W-1:0]  psum_wire      [N_ARR+1][N_ARR];
   logic                     psum_valid_wire[N_ARR+1][N_ARR];
+  logic signed [ACC_W-1:0]  drain_wire     [N_ARR][N_ARR+1];
 
   genvar r, c;
   generate
     for (r = 0; r < N_ARR; r++) begin : g_west_edge
       assign a_wire[r][0]       = a_in[r];
       assign a_valid_wire[r][0] = a_valid_in[r];
+      // Nothing shifts into the west end of the drain chain: the first
+      // drain cycle pushes zeros in behind the departing accumulators.
+      assign drain_wire[r][0]   = '0;
     end
 
     for (c = 0; c < N_ARR; c++) begin : g_north_edge
       assign op_wire[0][c]         = operand_in[c];
+      assign op_valid_wire[0][c]   = operand_valid_in[c];
       assign psum_wire[0][c]       = '0;
       assign psum_valid_wire[0][c] = 1'b0;
     end
@@ -70,12 +81,16 @@ module pe_array #(
           .a_valid_in    (a_valid_gated[r][c]),
           .a_out         (a_wire[r][c+1]),
           .a_valid_out   (a_valid_wire[r][c+1]),
-          .operand_in    (op_wire[r][c]),
-          .operand_out   (op_wire[r+1][c]),
+          .operand_in       (op_wire[r][c]),
+          .operand_valid_in (op_valid_wire[r][c]),
+          .operand_out      (op_wire[r+1][c]),
+          .operand_valid_out(op_valid_wire[r+1][c]),
           .psum_in       (psum_wire[r][c]),
           .psum_valid_in (psum_valid_wire[r][c]),
           .psum_out      (psum_wire[r+1][c]),
-          .psum_valid_out(psum_valid_wire[r+1][c])
+          .psum_valid_out(psum_valid_wire[r+1][c]),
+          .drain_in      (drain_wire[r][c]),
+          .drain_out     (drain_wire[r][c+1])
         );
 
         // Skew-correctness self-check (rows > 0 only -- row 0 has no
@@ -90,7 +105,7 @@ module pe_array #(
         if (r > 0) begin : g_valid_check
           assert property (
             @(posedge clk) disable iff (!rst_n)
-              (phase == 2'd2) |->
+              (phase == 3'd2) |->
                 (a_valid_gated[r][c] |-> psum_valid_wire[r][c])
           ) else $error("row-skew mismatch at PE(%0d,%0d)", r, c);
         end
@@ -100,6 +115,12 @@ module pe_array #(
     for (c = 0; c < N_ARR; c++) begin : g_south_edge
       assign psum_out[c]       = psum_wire[N_ARR][c];
       assign psum_valid_out[c] = psum_valid_wire[N_ARR][c];
+    end
+
+    // East edge of the drain chain. On drain cycle d, row r presents the
+    // accumulator that started in column N_ARR-1-d.
+    for (r = 0; r < N_ARR; r++) begin : g_east_edge
+      assign drain_out[r] = drain_wire[r][N_ARR];
     end
   endgenerate
 
@@ -112,12 +133,19 @@ module pe_array #(
   // valid registers still hold their last values for one cycle until
   // the inter-tile flush clears them. Counting those would overstate
   // real work during every tile changeover.
+  // Both dataflows report through the same counter so their measured
+  // work is directly comparable. WS multiplies against its stationary
+  // weight whenever an activation is valid; OS requires both the
+  // activation and the streaming weight to be valid in the same cycle.
   always_comb begin
     active_macs = '0;
-    if (phase == 2'd2)
-      for (int rr = 0; rr < N_ARR; rr++)
-        for (int cc = 0; cc < N_ARR; cc++)
-          if (a_valid_gated[rr][cc]) active_macs = active_macs + MAC_CNT_W'(1);
+    for (int rr = 0; rr < N_ARR; rr++)
+      for (int cc = 0; cc < N_ARR; cc++) begin
+        if (phase == 3'd2 && a_valid_gated[rr][cc])
+          active_macs = active_macs + MAC_CNT_W'(1);
+        if (phase == 3'd4 && a_valid_gated[rr][cc] && op_valid_wire[rr][cc])
+          active_macs = active_macs + MAC_CNT_W'(1);
+      end
   end
 
 endmodule
