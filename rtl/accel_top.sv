@@ -306,15 +306,38 @@ module accel_top #(
   //   OS's inner loop is K, so A hides only behind the tail of one
   //      compute plus the next B fetch -- and when K <= STREAM_DEPTH
   //      there is no second chunk to prefetch at all.
-  logic [31:0] os_gain, os_cost;
-  logic        adaptive_pick_os;
+  // Operand-fetch visibility under double buffering. A traffic no
+  // longer cancels between the dataflows: each hides its A fetch behind
+  // whatever its own inner loop leaves running, and those windows
+  // differ sharply.
+  //
+  //   WS's inner loop is M, so A hides behind compute *and* writeback.
+  //      Only the first chunk of each tile pays in full.
+  //   OS's inner loop is K, so A hides only behind the tail of one
+  //      compute plus the next B fetch -- and when K <= STREAM_DEPTH
+  //      there is no second chunk to prefetch at all.
+  logic [DIM_W-1:0] m_cap, k_cap;
+  assign m_cap = (cfg_m > DIM_W'(STREAM_DEPTH)) ? DIM_W'(STREAM_DEPTH) : cfg_m;
+  assign k_cap = (cfg_k > DIM_W'(STREAM_DEPTH)) ? DIM_W'(STREAM_DEPTH) : cfg_k;
+
   // cfg_m/n/k are all non-zero when cfg_valid holds, so ktiles and
   // mtiles are at least 1 and these subtractions cannot underflow.
-  assign os_gain = (32'd2 * 32'(cfg_m) * 32'(cfg_n) * 32'(ktiles - DIM_W'(1)))
-                 + (32'(ntiles) * 32'(cfg_k));
-  assign os_cost = (32'(cfg_k) * 32'(cfg_n) * 32'(mtiles - DIM_W'(1)))
-                 + (32'(N_ARR + 1) * 32'(mtiles) * 32'(ntiles));
-  assign adaptive_pick_os = (os_gain > os_cost);
+  logic [47:0] term_rmw, term_wload, term_ws_a;   // favour OS
+  logic [47:0] term_os_a, term_bref, term_cd;     // favour WS
+  logic        adaptive_pick_os;
+
+  assign term_rmw   = 48'd2 * 48'(cfg_m) * 48'(cfg_n) * 48'(ktiles - DIM_W'(1));
+  assign term_wload = 48'(ntiles) * 48'(cfg_k);
+  assign term_ws_a  = 48'(ntiles) * 48'(m_cap) * 48'(cfg_k);
+  assign term_os_a  = 48'(ntiles) * 48'(cfg_m) * 48'(k_cap);
+  assign term_bref  = 48'(cfg_k) * 48'(cfg_n) * 48'(mtiles - DIM_W'(1));
+  assign term_cd    = 48'(N_ARR + 1) * 48'(mtiles) * 48'(ntiles);
+
+  // Written as one comparison with every term on its favouring side, so
+  // the A-visibility difference (which may point either way) never
+  // needs a signed subtraction.
+  assign adaptive_pick_os = (term_rmw + term_wload + term_ws_a) >
+                            (term_os_a + term_bref + term_cd);
 
   // The resolved decision for a transaction about to start. Both the
   // mode_os latch and the IDLE next-state decode must use this same
