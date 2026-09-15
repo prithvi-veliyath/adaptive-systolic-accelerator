@@ -119,7 +119,9 @@ module accel_top #(
   // [m][k] because it streams M through a resident weight tile, OS
   // indexes it [k][m] because it streams K through resident
   // accumulators. Same storage, same capacity, different access order.
-  logic signed [DATA_W-1:0] a_buf [STREAM_DEPTH][N_ARR];
+  // Double-buffered: the array computes out of one bank while the fetch
+  // engine fills the other with the next inner-loop chunk.
+  logic signed [DATA_W-1:0] a_buf [2][STREAM_DEPTH][N_ARR];
   logic signed [DATA_W-1:0] b_buf [STREAM_DEPTH][N_ARR]; // b_buf[kk][nn]
   logic signed [ACC_W-1:0]  c_buf [STREAM_DEPTH][N_ARR]; // c_buf[mm][nn]
 
@@ -198,12 +200,30 @@ module accel_top #(
   assign load_last = (load_cnt == IDX_W'(k_span[IDX_W:0] - MCNT_W'(1)));
 
   // ---- A-chunk fetch (m_span rows x k_span columns of A) ----
+  //
+  // The fetch engine runs independently of the main FSM: it is launched
+  // by whichever state knows the next chunk's address, and then walks
+  // the tile on its own regardless of what the array is doing. That is
+  // what lets an operand fetch overlap a compute, and it also lets the
+  // A and B buses run concurrently, which they could not when both
+  // fetches were FSM states.
+  //
+  // af_fill_bank is the bank being filled; a_use_bank is the bank the
+  // array reads. They are swapped when a completed fetch is consumed,
+  // so a prefetch never writes the bank currently under compute.
   logic [MIDX_W-1:0] af_mm;
   logic [MIDX_W-1:0] af_kk;
   logic [ADDR_W-1:0] af_addr;
   logic              af_active, af_last;
-  assign af_last = (af_mm == MIDX_W'(m_span - MCNT_W'(1))) &&
-                   (af_kk == MIDX_W'(k_span - MCNT_W'(1)));
+  logic              af_fill_bank, a_use_bank;
+  // A fetch has been launched for the next compute and not yet consumed.
+  logic              a_pending;
+  // Snapshot of the spans the in-flight fetch was launched with. The
+  // live spans move with the loop origins, which advance before the
+  // prefetch is consumed, so the walk must not read them.
+  logic [MCNT_W-1:0] af_m_span, af_k_span;
+  assign af_last = (af_mm == MIDX_W'(af_m_span - MCNT_W'(1))) &&
+                   (af_kk == MIDX_W'(af_k_span - MCNT_W'(1)));
 
   // ---- Compute ----
   logic [CCNT_W-1:0] compute_cnt;
@@ -276,6 +296,16 @@ module accel_top #(
   assign mtiles = (cfg_m + DIM_W'(N_ARR-1)) >> LOG2_N;
   assign ntiles = (cfg_n + DIM_W'(N_ARR-1)) >> LOG2_N;
 
+  // Operand-fetch visibility under double buffering. A traffic no
+  // longer cancels between the dataflows: each hides its A fetch behind
+  // whatever its own inner loop leaves running, and those windows
+  // differ sharply.
+  //
+  //   WS's inner loop is M, so A hides behind compute *and* writeback.
+  //      Only the first chunk of each tile pays in full.
+  //   OS's inner loop is K, so A hides only behind the tail of one
+  //      compute plus the next B fetch -- and when K <= STREAM_DEPTH
+  //      there is no second chunk to prefetch at all.
   logic [31:0] os_gain, os_cost;
   logic        adaptive_pick_os;
   // cfg_m/n/k are all non-zero when cfg_valid holds, so ktiles and
@@ -373,8 +403,8 @@ module accel_top #(
 
       assign a_valid_in_arr[gr] = sel_ws || sel_os;
       // WS reads a_buf[m][k=row]; OS reads a_buf[t][i=row].
-      assign a_in_arr[gr] = sel_ws ? a_buf[idx_ws[MIDX_W-1:0]][gr] :
-                            sel_os ? a_buf[idx_os[MIDX_W-1:0]][gr] : '0;
+      assign a_in_arr[gr] = sel_ws ? a_buf[a_use_bank][idx_ws[MIDX_W-1:0]][gr] :
+                            sel_os ? a_buf[a_use_bank][idx_os[MIDX_W-1:0]][gr] : '0;
     end
 
     for (gr = 0; gr < N_ARR; gr++) begin : g_weight_feed
@@ -473,7 +503,11 @@ module accel_top #(
       S_BFETCH:  if (bf_active && bf_last)
                    state_n = mode_os ? S_AFETCH : S_WLOAD;
       S_WLOAD:   if (load_last)                       state_n = S_AFETCH;
-      S_AFETCH:  if (af_active && af_last)
+      // Leave as soon as the fetch has landed *or* lands on this edge.
+      // Waiting an extra cycle to observe completion would tax every
+      // cold-start fetch, which is most of them whenever the inner loop
+      // runs only once (K <= STREAM_DEPTH in OS, for instance).
+      S_AFETCH:  if (!af_active || af_last)
                    state_n = mode_os ? S_OS_COMPUTE : S_COMPUTE;
 
       S_COMPUTE: if (compute_cnt == compute_last)     state_n = S_WB;
@@ -508,10 +542,15 @@ module accel_top #(
       bf_addr     <= '0;
       bf_active   <= 1'b0;
       load_cnt    <= '0;
-      af_mm       <= '0;
-      af_kk       <= '0;
-      af_addr     <= '0;
-      af_active   <= 1'b0;
+      af_mm        <= '0;
+      af_kk        <= '0;
+      af_addr      <= '0;
+      af_active    <= 1'b0;
+      af_fill_bank <= 1'b0;
+      a_use_bank   <= 1'b0;
+      a_pending    <= 1'b0;
+      af_m_span    <= '0;
+      af_k_span    <= '0;
       compute_cnt <= '0;
       wb_mm       <= '0;
       wb_nn       <= '0;
@@ -526,11 +565,44 @@ module accel_top #(
       state <= state_n;
       error <= 1'b0;
 
+      // ---- A fetch engine ----
+      // Runs in whatever state the FSM happens to be in. Placed before
+      // the case so that a launch inside an arm overrides this walk on
+      // the same edge.
+      //
+      // As everywhere else here, the pre-edge counters are exactly the
+      // coordinates of the request that was on the bus during the cycle
+      // now ending, so mem_a_rdata at this edge is that element.
+      if (af_active) begin
+        // WS stores A as [m][k]; OS stores it transposed as [k][m],
+        // because OS streams the reduction index through the array
+        // while WS streams the output-row index.
+        if (mode_os) a_buf[af_fill_bank][af_kk][af_mm[IDX_W-1:0]] <= mem_a_rdata;
+        else         a_buf[af_fill_bank][af_mm][af_kk[IDX_W-1:0]] <= mem_a_rdata;
+
+        if (af_kk == MIDX_W'(af_k_span - MCNT_W'(1))) begin
+          af_kk   <= '0;
+          // Next A row: advance by K, back to this chunk's k origin.
+          af_addr <= af_addr + ADDR_W'(cfg_k) - ADDR_W'(af_k_span) + ADDR_W'(1);
+          if (af_last) af_active <= 1'b0;
+          else         af_mm     <= af_mm + 1'b1;
+        end else begin
+          af_kk   <= af_kk + 1'b1;
+          af_addr <= af_addr + ADDR_W'(1);
+        end
+      end
+
       unique case (state)
         S_IDLE: begin
           n0 <= '0;
           k0 <= '0;
           m0 <= '0;
+          // A prefetch must never survive into the next transaction:
+          // its address and spans belong to the previous shape.
+          af_active    <= 1'b0;
+          a_pending    <= 1'b0;
+          af_fill_bank <= 1'b0;
+          a_use_bank   <= 1'b0;
           if (start && cfg_valid) begin
             // Latch the dataflow for the whole transaction. Every span
             // and every state transition keys off this, so it must not
@@ -574,13 +646,17 @@ module accel_top #(
               bf_nn   <= bf_nn + 1'b1;
               bf_addr <= bf_addr + ADDR_W'(1);
             end
-            // OS skips the weight load and goes straight to A, so set
-            // up the A walk as the B walk finishes.
-            if (bf_last && mode_os) begin
+            // OS skips the weight load and goes straight to A. Launch
+            // the fetch only if one is not already in flight from a
+            // prefetch issued during the previous compute.
+            if (bf_last && mode_os && !a_pending) begin
               af_mm     <= '0;
               af_kk     <= '0;
               af_addr   <= addr_a_base;
+              af_m_span <= m_span;
+              af_k_span <= k_span;
               af_active <= 1'b1;
+              a_pending <= 1'b1;
             end
           end
           load_cnt <= '0;
@@ -590,38 +666,52 @@ module accel_top #(
           // Saturate rather than wrap, so a redundant LOAD cycle re-latches
           // the correct final row instead of re-injecting the wrong one.
           if (!load_last) load_cnt <= load_cnt + 1'b1;
-          if (load_last) begin
+          if (load_last && !a_pending) begin
             af_mm     <= '0;
             af_kk     <= '0;
             af_addr   <= addr_a_base;
+            af_m_span <= m_span;
+            af_k_span <= k_span;
             af_active <= 1'b1;
+            a_pending <= 1'b1;
           end
         end
 
+        // Pure wait state now: the fetch itself was launched earlier,
+        // either by the phase that knew the new tile's base address or
+        // as a prefetch during the previous compute. When it has landed
+        // the banks swap, so the array computes from the bank just
+        // filled while the next prefetch targets the other one.
         S_AFETCH: begin
-          if (af_active) begin
-            // WS stores A as [m][k]; OS stores it transposed as [k][m],
-            // because OS streams the reduction index through the array
-            // while WS streams the output-row index.
-            if (mode_os) a_buf[af_kk][af_mm[IDX_W-1:0]] <= mem_a_rdata;
-            else         a_buf[af_mm][af_kk[IDX_W-1:0]] <= mem_a_rdata;
-
-            if (af_kk == MIDX_W'(k_span - MCNT_W'(1))) begin
-              af_kk   <= '0;
-              // Next A row: advance by K, back to this tile's k origin.
-              af_addr <= af_addr + ADDR_W'(cfg_k) - ADDR_W'(k_span) + ADDR_W'(1);
-              if (af_last) af_active <= 1'b0;
-              else         af_mm     <= af_mm + 1'b1;
-            end else begin
-              af_kk   <= af_kk + 1'b1;
-              af_addr <= af_addr + ADDR_W'(1);
-            end
-          end
           compute_cnt <= '0;
+          // The swap is safe on the same edge that captures the last
+          // element: both are non-blocking, so the bank becomes the
+          // read bank exactly when its final write lands.
+          if (!af_active || af_last) begin
+            a_use_bank   <= af_fill_bank;
+            af_fill_bank <= ~af_fill_bank;
+            a_pending    <= 1'b0;
+          end
         end
 
         S_COMPUTE: begin
           compute_cnt <= compute_cnt + 1'b1;
+          // Prefetch the next M chunk's activations while this one
+          // computes. WS streams M through a resident weight tile, so
+          // the next inner iteration is the next M chunk and its base
+          // address is known already. The fetch runs through COMPUTE
+          // and WB, which together are far longer than the fetch for
+          // any realistic chunk, so it is normally fully hidden.
+          if ((compute_cnt == '0) && more_m && !a_pending) begin
+            af_mm     <= '0;
+            af_kk     <= '0;
+            af_addr   <= ADDR_W'(m0_nx * cfg_k + k0);
+            af_m_span <= (DIM_W'(m0_nx) + DIM_W'(SD_M) <= cfg_m)
+                       ? SD_M : MCNT_W'(cfg_m - m0_nx);
+            af_k_span <= k_span;
+            af_active <= 1'b1;
+            a_pending <= 1'b1;
+          end
           if (compute_cnt == compute_last) begin
             wb_mm     <= '0;
             wb_nn     <= '0;
@@ -633,6 +723,20 @@ module accel_top #(
 
         S_OS_COMPUTE: begin
           compute_cnt <= compute_cnt + 1'b1;
+          // OS streams K, so the next inner iteration is the next K
+          // chunk. Prefetching it also lets this A fetch overlap the
+          // following B fetch, since the two memory interfaces are
+          // independent -- something the all-serial FSM could not do.
+          if ((compute_cnt == '0) && more_k && !a_pending) begin
+            af_mm     <= '0;
+            af_kk     <= '0;
+            af_addr   <= ADDR_W'(m0 * cfg_k + k0_nx);
+            af_m_span <= m_span;
+            af_k_span <= (DIM_W'(k0_nx) + DIM_W'(SD_M) <= cfg_k)
+                       ? SD_M : MCNT_W'(cfg_k - k0_nx);
+            af_active <= 1'b1;
+            a_pending <= 1'b1;
+          end
           if (compute_cnt == compute_last) begin
             drain_cnt <= '0;
             if (more_k) begin
@@ -695,12 +799,10 @@ module accel_top #(
         end else begin
           if (more_m) begin
             // Weights stay resident: straight back to the A fetch with
-            // no B refetch and no weight reload.
-            m0        <= m0_nx;
-            af_mm     <= '0;
-            af_kk     <= '0;
-            af_addr   <= ADDR_W'(m0_nx * cfg_k + k0);
-            af_active <= 1'b1;
+            // no B refetch and no weight reload. The fetch itself was
+            // already launched as a prefetch at the start of the
+            // compute that just finished.
+            m0 <= m0_nx;
           end else begin
             m0 <= '0;
             bf_kk     <= '0;
@@ -726,8 +828,11 @@ module accel_top #(
   assign busy = (state != S_IDLE) && (state != S_DONE);
   assign done = (state == S_DONE);
 
+  // Not gated on a state: the fetch engine owns the A bus whenever it
+  // is running, which is what allows it to overlap compute, writeback
+  // and the B fetch.
   assign mem_a_addr  = af_addr;
-  assign mem_a_rd_en = (state == S_AFETCH) && af_active;
+  assign mem_a_rd_en = af_active;
 
   assign mem_b_addr  = bf_addr;
   assign mem_b_rd_en = (state == S_BFETCH) && bf_active;
@@ -798,10 +903,7 @@ module accel_top #(
           cnt_wload <= cnt_wload + 32'd1;
           if (load_last) cnt_weight_tiles <= cnt_weight_tiles + 32'd1;
         end
-        S_AFETCH: begin
-          cnt_afetch <= cnt_afetch + 32'd1;
-          if (af_active) cnt_bytes_a <= cnt_bytes_a + 32'd1;
-        end
+        S_AFETCH: cnt_afetch <= cnt_afetch + 32'd1;
         // Both dataflows report compute occupancy and MACs through the
         // same counters, so the two are directly comparable. Clear and
         // drain are OS-only overhead and are counted separately as
@@ -818,6 +920,9 @@ module accel_top #(
         default: ;
       endcase
 
+      // A-operand traffic is counted off the bus rather than off a
+      // state, because the fetch engine now runs in every state.
+      if (mem_a_rd_en) cnt_bytes_a  <= cnt_bytes_a + 32'd1;
       if (mem_c_wr_en) cnt_c_writes <= cnt_c_writes + 32'd1;
       if (mem_c_rd_en) cnt_c_rmw    <= cnt_c_rmw + 32'd1;
     end

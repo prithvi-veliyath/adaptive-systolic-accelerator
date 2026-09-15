@@ -62,6 +62,16 @@ struct PhaseCounts {
 // memory and back (the 2x writeback below). OS tiles M onto the array
 // and streams K, so the reduction completes in place and C is written
 // exactly once, at the cost of re-fetching B for every M tile.
+// S_AFETCH is a wait state under double buffering: it costs one cycle to
+// observe the fetch landed and swap banks, plus however much of the
+// fetch was left unhidden. A cold start (first chunk of a tile) has no
+// overlap window at all; later chunks were prefetched during the
+// previous compute, so only the excess over that window is visible.
+static int afetch_cost(int fetch, int overlap) {
+  if (overlap < 0) return fetch;                  // cold start: no prefetch
+  return std::max(1, fetch - overlap);            // 1 cycle if fully hidden
+}
+
 static PhaseCounts model_ws(int M, int Nn, int K) {
   PhaseCounts p;
   for (int n0 = 0; n0 < Nn; n0 += N_ARR) {
@@ -71,12 +81,19 @@ static PhaseCounts model_ws(int M, int Nn, int K) {
       bool k_first = (k0 == 0);
       p.bfetch += k_tile * n_tile;
       p.wload  += k_tile;
+      int overlap = -1;  // no prefetch window for the first M chunk
       for (int m0 = 0; m0 < M; m0 += STREAM_DEPTH) {
         int m_chunk = std::min(STREAM_DEPTH, M - m0);
-        p.afetch  += m_chunk * k_tile;
-        p.compute += m_chunk + n_tile + N_ARR - 1;
-        p.wb      += m_chunk * n_tile * (k_first ? 1 : 2);
+        int compute_len = m_chunk + n_tile + N_ARR - 1;
+        int wb_len      = m_chunk * n_tile * (k_first ? 1 : 2);
+        p.afetch  += afetch_cost(m_chunk * k_tile, overlap);
+        p.compute += compute_len;
+        p.wb      += wb_len;
         p.next    += 1;
+        // The next chunk's fetch is launched one cycle into this
+        // compute and runs through the rest of it, the writeback and
+        // the loop-advance cycle.
+        overlap = compute_len + wb_len;
       }
     }
   }
@@ -91,11 +108,19 @@ static PhaseCounts model_os(int M, int Nn, int K) {
     for (int n0 = 0; n0 < Nn; n0 += N_ARR) {
       int n_tile = std::min(N_ARR, Nn - n0);
       p.os_clear += 1;
+      int overlap = -1;  // no prefetch window for the first K chunk
       for (int k0 = 0; k0 < K; k0 += STREAM_DEPTH) {
         int k_chunk = std::min(STREAM_DEPTH, K - k0);
-        p.bfetch  += k_chunk * n_tile;
-        p.afetch  += m_tile * k_chunk;
-        p.compute += k_chunk + m_tile + n_tile - 2;
+        int compute_len = k_chunk + m_tile + n_tile - 2;
+        int bfetch_len  = k_chunk * n_tile;
+        p.bfetch  += bfetch_len;
+        p.afetch  += afetch_cost(m_tile * k_chunk, overlap);
+        p.compute += compute_len;
+        // The next K chunk's A fetch is launched one cycle into this
+        // compute and keeps running through that chunk's B fetch --
+        // the two memory interfaces are independent.
+        int next_k = std::min(STREAM_DEPTH, K - (k0 + k_chunk));
+        overlap = (compute_len - 1) + (next_k > 0 ? next_k * n_tile : 0);
       }
       p.os_drain += N_ARR;   // chain is N_ARR wide regardless of n_tile
       p.wb       += m_tile * n_tile;  // always a direct write
@@ -329,11 +354,16 @@ static PhaseCounts shape_test(Harness& h, const std::string& name, int M, int Nn
               static_cast<uint32_t>(((Nn + N_ARR - 1) / N_ARR) * k_tiles),
           name + ": weight-tile counter wrong");
   }
-  // Operand traffic: every A and B element of every tile is fetched once.
+  // Operand traffic, counted as elements moved rather than as cycles
+  // spent -- under double buffering the A fetch overlaps other phases,
+  // so its cycle count and its byte count are no longer the same
+  // number. Both dataflows re-read the full A matrix once per N tile.
+  int n_tiles = (Nn + N_ARR - 1) / N_ARR;
   check(h.perf(PERF_BYTES_B) == static_cast<uint32_t>(exp.bfetch),
         name + ": B byte counter disagrees with fetch cycles");
-  check(h.perf(PERF_BYTES_A) == static_cast<uint32_t>(exp.afetch),
-        name + ": A byte counter disagrees with fetch cycles");
+  check(h.perf(PERF_BYTES_A) == static_cast<uint32_t>(M) * K * n_tiles,
+        name + ": A byte counter = " + std::to_string(h.perf(PERF_BYTES_A)) +
+            ", expected M*K*Ntiles = " + std::to_string(M * K * n_tiles));
 
   if (verbose) {
     uint32_t slots = h.perf(PERF_MAC_SLOTS);
@@ -406,6 +436,34 @@ static bool policy_cost_model(int M, int Nn, int K) {
   return os_gain > os_cost;
 }
 
+// Same idea, corrected for double buffering.
+//
+// The original model let A-operand traffic cancel, because both
+// dataflows moved the same A elements at the same cost. With a prefetch
+// engine that is no longer true: each dataflow hides A behind whatever
+// its inner loop leaves running, and those windows are very different.
+//
+//   WS's inner loop is M, so its A fetch hides behind compute AND the
+//      writeback -- a long window, and only the first chunk of each
+//      tile pays in full: ~Ntiles * min(M,STREAM_DEPTH) * K visible.
+//   OS's inner loop is K, so its A fetch hides only behind the rest of
+//      one compute plus the next B fetch, and when K <= STREAM_DEPTH
+//      there is no second chunk to prefetch at all:
+//      ~Ntiles * M * min(K,STREAM_DEPTH) visible.
+//
+// The difference of those two is what the corrected rule adds.
+static bool policy_cost_model_db(int M, int Nn, int K) {
+  int ktiles = ceil_div(K, N_ARR);
+  int mtiles = ceil_div(M, N_ARR);
+  int ntiles = ceil_div(Nn, N_ARR);
+  int ws_vis_a = ntiles * std::min(M, STREAM_DEPTH) * K;
+  int os_vis_a = ntiles * M * std::min(K, STREAM_DEPTH);
+  long os_gain = 2L * M * Nn * (ktiles - 1) + (long)ntiles * K
+               + ((long)ws_vis_a - (long)os_vis_a);
+  long os_cost = (long)K * Nn * (mtiles - 1) + (long)(N_ARR + 1) * mtiles * ntiles;
+  return os_gain > os_cost;
+}
+
 struct PolicyStat {
   const char* name;
   int correct = 0;
@@ -446,6 +504,7 @@ static void run_sweep(Harness& h) {
   int ws_wins = 0, os_wins = 0, ties = 0, points = 0;
   PolicyStat st_ws{"always WS"}, st_os{"always OS"};
   PolicyStat st_k{"K > N_ARR"}, st_cm{"cost-difference model"};
+  PolicyStat st_db{"cost model + prefetch"};
   PolicyStat st_hw{"ADAPTIVE (in hardware)"};
 
   for (int mi = 0; mi < 4; mi++)
@@ -487,6 +546,7 @@ static void run_sweep(Harness& h) {
         score(st_os, true,  wc, oc);
         score(st_k,  policy_k_gt_narr(M, Nn, K), wc, oc);
         score(st_cm, policy_cost_model(M, Nn, K), wc, oc);
+        score(st_db, policy_cost_model_db(M, Nn, K), wc, oc);
         score(st_hw, ad_chose_os, wc, oc);
 
         std::printf("%6d %4d %4d | %8d %8d | %-6s %6.1f%% | "
@@ -510,7 +570,7 @@ static void run_sweep(Harness& h) {
   // the measured winner, not against the analytical model.
   std::printf("\nPolicy evaluation (oracle = always pick the measured winner)\n");
   std::printf("%-24s %8s %12s %10s\n", "policy", "correct", "total regret", "worst");
-  const PolicyStat* all[] = {&st_ws, &st_os, &st_k, &st_cm, &st_hw};
+  const PolicyStat* all[] = {&st_ws, &st_os, &st_k, &st_cm, &st_db, &st_hw};
   for (const PolicyStat* s : all) {
     std::printf("%-24s %5d/%-3d %12ld %9.1f%%\n",
                 s->name, s->correct, points, s->regret, s->worst);
