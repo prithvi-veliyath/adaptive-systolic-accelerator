@@ -81,6 +81,8 @@ module accel_top #(
 
   localparam logic [1:0] POLICY_FORCE_WS = 2'b00;
   localparam logic [1:0] POLICY_FORCE_OS = 2'b01;
+  localparam logic [1:0] POLICY_ADAPTIVE = 2'b10;
+  // 2'b11 is RESERVED and must continue to be rejected.
 
   localparam int DIM_W   = 16;
   localparam int IDX_W   = $clog2(N_ARR);                 // array row/col index
@@ -243,10 +245,61 @@ module accel_top #(
   // after its write half (phase 1). Non-pipelined by design for v1.
   assign wb_final = c_direct ? (wb_phase == 1'b0) : (wb_phase == 1'b1);
 
+  // ---- Shape-aware dataflow selection (ADAPTIVE) ----
+  //
+  // Derived from the Milestone 5 measurement sweep, not assumed. The two
+  // dataflows move exactly the same A traffic, so that term cancels and
+  // the choice reduces to four structural costs:
+  //
+  //   WS pays 2 extra C accesses per output for every K tile after the
+  //      first, because partial sums must spill and be re-read
+  //                                   -> 2*M*N*(Ktiles-1)
+  //   WS pays one weight load per (n,k) tile
+  //                                   -> Ntiles*K
+  //   OS re-reads the whole B tile once per M tile, because only N_ARR
+  //      output rows are resident at a time
+  //                                   -> K*N*(Mtiles-1)
+  //   OS pays a clear and an N_ARR-cycle drain per output tile
+  //                                   -> (N_ARR+1)*Mtiles*Ntiles
+  //
+  // Choose OS when its savings exceed its costs. Scored against measured
+  // cycles over a 56-shape sweep this picks the faster dataflow on every
+  // shape (zero regret); the simpler "K > N_ARR" rule got 54/56 and lost
+  // up to 5.8% on the shapes it missed.
+  //
+  // This is evaluated once per transaction at start, never per cycle, so
+  // the multipliers are a one-shot cost rather than a critical path.
+  localparam int LOG2_N = $clog2(N_ARR);
+
+  logic [DIM_W-1:0] ktiles, mtiles, ntiles;
+  assign ktiles = (cfg_k + DIM_W'(N_ARR-1)) >> LOG2_N;
+  assign mtiles = (cfg_m + DIM_W'(N_ARR-1)) >> LOG2_N;
+  assign ntiles = (cfg_n + DIM_W'(N_ARR-1)) >> LOG2_N;
+
+  logic [31:0] os_gain, os_cost;
+  logic        adaptive_pick_os;
+  // cfg_m/n/k are all non-zero when cfg_valid holds, so ktiles and
+  // mtiles are at least 1 and these subtractions cannot underflow.
+  assign os_gain = (32'd2 * 32'(cfg_m) * 32'(cfg_n) * 32'(ktiles - DIM_W'(1)))
+                 + (32'(ntiles) * 32'(cfg_k));
+  assign os_cost = (32'(cfg_k) * 32'(cfg_n) * 32'(mtiles - DIM_W'(1)))
+                 + (32'(N_ARR + 1) * 32'(mtiles) * 32'(ntiles));
+  assign adaptive_pick_os = (os_gain > os_cost);
+
+  // The resolved decision for a transaction about to start. Both the
+  // mode_os latch and the IDLE next-state decode must use this same
+  // expression: keying the state decode off cfg_policy directly would
+  // send an ADAPTIVE run that picked OS into the WS entry state,
+  // skipping S_OS_CLEAR and leaving the accumulators unzeroed.
+  logic start_mode_os;
+  assign start_mode_os = (cfg_policy == POLICY_FORCE_OS) ||
+                         ((cfg_policy == POLICY_ADAPTIVE) && adaptive_pick_os);
+
   // ---- cfg validation ----
   logic policy_supported;
   assign policy_supported = (cfg_policy == POLICY_FORCE_WS) ||
-                            (cfg_policy == POLICY_FORCE_OS);
+                            (cfg_policy == POLICY_FORCE_OS) ||
+                            (cfg_policy == POLICY_ADAPTIVE);
 
   logic cfg_valid;
   assign cfg_valid = (cfg_m != '0) && (cfg_n != '0) && (cfg_k != '0) &&
@@ -414,7 +467,7 @@ module accel_top #(
     state_n = state;
     unique case (state)
       S_IDLE: if (start && cfg_valid)
-                state_n = (cfg_policy == POLICY_FORCE_OS) ? S_OS_CLEAR : S_BFETCH;
+                state_n = start_mode_os ? S_OS_CLEAR : S_BFETCH;
 
       // Shared operand fetch: the next state depends only on the mode.
       S_BFETCH:  if (bf_active && bf_last)
@@ -481,8 +534,10 @@ module accel_top #(
           if (start && cfg_valid) begin
             // Latch the dataflow for the whole transaction. Every span
             // and every state transition keys off this, so it must not
-            // move once a run is under way.
-            mode_os   <= (cfg_policy == POLICY_FORCE_OS);
+            // move once a run is under way. ADAPTIVE resolves here, at
+            // the single point where the shape is known and nothing is
+            // yet in flight.
+            mode_os   <= start_mode_os;
             // First tile is (n0,k0) = (0,0), so its B base address is 0.
             bf_kk     <= '0;
             bf_nn     <= '0;
@@ -702,7 +757,8 @@ module accel_top #(
       PERF_MAC_SLOTS    = 5'd10, PERF_BYTES_A        = 5'd11,
       PERF_BYTES_B      = 5'd12, PERF_C_WRITES       = 5'd13,
       PERF_C_RMW        = 5'd14, PERF_ERRORS         = 5'd15,
-      PERF_OS_CLEAR     = 5'd16, PERF_OS_DRAIN       = 5'd17;
+      PERF_OS_CLEAR     = 5'd16, PERF_OS_DRAIN       = 5'd17,
+      PERF_MODE         = 5'd18;  // 0 = ran WS, 1 = ran OS
 
   logic [31:0] cnt_total, cnt_compute, cnt_bfetch, cnt_wload, cnt_afetch;
   logic [31:0] cnt_wb, cnt_weight_tiles, cnt_m_chunks, cnt_mac;
@@ -783,6 +839,8 @@ module accel_top #(
       PERF_STALL:          perf_rdata = cnt_total - cnt_compute;
       PERF_OS_CLEAR:       perf_rdata = cnt_os_clear;
       PERF_OS_DRAIN:       perf_rdata = cnt_os_drain;
+      // Lets software read back which dataflow ADAPTIVE actually chose.
+      PERF_MODE:           perf_rdata = {31'd0, mode_os};
       PERF_WEIGHT_TILES:   perf_rdata = cnt_weight_tiles;
       PERF_M_CHUNKS:       perf_rdata = cnt_m_chunks;
       PERF_MAC_OPS:        perf_rdata = cnt_mac;
@@ -842,6 +900,19 @@ module accel_top #(
   endproperty
   assert property (p_os_never_reads_c)
     else $error("OS issued a C read; accumulator escaped the array");
+
+  // An OS transaction must enter through the accumulator clear. Without
+  // this, a run that reaches OS compute with stale accumulators can
+  // still produce correct results by luck -- a completed drain happens
+  // to leave zeros behind it -- so correctness checking alone does not
+  // catch a missing clear.
+  property p_os_enters_via_clear;
+    @(posedge clk) disable iff (!rst_n)
+      ((state == S_IDLE) && start && cfg_valid && start_mode_os)
+        |=> (state == S_OS_CLEAR);
+  endproperty
+  assert property (p_os_enters_via_clear)
+    else $error("OS transaction started without clearing accumulators");
 
   // The dataflow must not change while a transaction is in flight.
   // Both cycles must be busy: mode_os is latched on the very edge that
