@@ -4,7 +4,8 @@ Reference for the adaptive systolic accelerator. Tracks what is **actually
 implemented and verified**; sections marked *(planned)* are deliberately not
 built yet.
 
-**Current state: Milestone 2 — tiled weight-stationary GEMM, verified.**
+**Current state: Milestones 1–6 — both dataflows on a shared array, hardware
+counters, a measured WS-vs-OS sweep, and an adaptive policy derived from it.**
 
 ---
 
@@ -49,13 +50,17 @@ address fits in `ADDR_W = 16` bits (`255 * 256 = 65280 < 65536`).
 | Encoding | Policy | Status |
 |---|---|---|
 | `2'b00` | `FORCE_WS` | implemented |
-| `2'b01` | `FORCE_OS` | rejected: `error`, `busy` stays low |
-| `2'b10` | `ADAPTIVE` | rejected: `error`, `busy` stays low |
+| `2'b01` | `FORCE_OS` | implemented |
+| `2'b10` | `ADAPTIVE` | implemented (§9) |
 | `2'b11` | `RESERVED` | rejected: `error`, `busy` stays low |
 
-`ADAPTIVE` deliberately does **not** silently degrade to WS or OS. Faking
-adaptivity before the scheduler exists would invalidate every later
-measurement.
+Through Milestones 1–5, `ADAPTIVE` deliberately raised `error` rather than
+silently degrading to WS or OS. Faking adaptivity before the scheduler existed
+would have invalidated every measurement taken through it — including the sweep
+the real policy was later derived from. `RESERVED` is still rejected.
+
+`PERF_MODE` reports which dataflow actually ran, so software can read back what
+`ADAPTIVE` decided.
 
 ---
 
@@ -234,6 +239,35 @@ Verilator's `UNSIGNED` warning caught it — but only after the file-scope
 and would have covered all future code in the file. Replaced with width-matched
 localparams; the design is now clean under `-Wall` with **no** width waiver.
 
+### Milestone 3
+
+**8.8 Ragged-N tiles burned MACs on discarded work.** The activation valid
+travels west-to-east through every column of a row, so with `n_span < N_ARR` the
+columns still holding a previous tile's weights kept multiplying. Their results
+were never captured, so **every correctness test passed** while the array burned
+real MACs and real power. Invisible until the MAC counter was cross-checked
+against `M*N*K`: `37x10x13` reported 5763 MACs against 4810 expected, about 17%
+waste. The pattern was exact — over-counting occurred precisely when
+`n_span < N_ARR`. **Fix:** gate the valid entering each PE with
+`column < n_active`; an inactive PE registers a zero valid, which starves the
+rest of the row, so only the first inactive column needs the gate.
+
+This is the clearest argument in the project for building the counters: a
+functional testbench cannot see wasted work, only wrong work.
+
+### Milestone 6
+
+**8.9 ADAPTIVE skipped the accumulator clear.** The IDLE next-state decode tested
+`cfg_policy == FORCE_OS` literally, so an `ADAPTIVE` run that *chose* OS entered
+through the WS path and never passed through `S_OS_CLEAR`. Results were still
+correct, because a completed drain shifts zeros in behind itself and leaves the
+array clear by accident — so again no correctness test could see it. What caught
+it was cross-checking `ADAPTIVE`'s cycle count against a forced run of the
+dataflow it reported choosing: the missing clear cycles did not add up.
+**Fix:** both the decode and the mode latch now key off one resolved
+`start_mode_os` expression, plus an assertion (`p_os_enters_via_clear`) that an
+OS transaction must enter through the clear.
+
 ### Milestone 2
 
 **8.5 Valid propagation killed ragged-K results.** Regenerating `psum_valid`
@@ -291,14 +325,16 @@ than a scheduling one. Weight-stationary execution must spill and re-read
 partial sums through C whenever K exceeds the array height. **Output-stationary
 execution keeps the accumulator resident in the PE and pays none of that.**
 
-That is a concrete, measured hypothesis for Milestones 4–5 to test:
+That was the concrete, measured hypothesis for Milestones 4–5 to test:
 
 > WS should lose to OS as K grows relative to `N_ARR`, and the crossover should
 > track the point where accumulated C read-modify-write traffic exceeds OS's
 > fixed drain cost.
 
-This is precisely the question the project was built to answer, and it now has
-real data behind it instead of intuition.
+**The hypothesis was confirmed, with a correction.** The crossover does track K,
+but it is not fixed — it *rises with M*, because OS's own overheads (re-reading
+B once per M tile, and a clear plus drain per output tile) also scale with the
+number of M tiles. The measurements are in §9b.
 
 ### Model vs. frozen cost model
 
@@ -317,6 +353,83 @@ correcting.
 
 ---
 
+## 9b. WS vs OS measurement (Milestone 5)
+
+Both dataflows over a 56-shape grid (`M in {1,4,16,64}`, `N in {4,16}`,
+`K in {1,2,4,8,16,32,64}`), identical data, each run verified against the
+golden model. Full data in `docs/benchmark.csv`; regenerate with `make bench`.
+
+**WS wins 14, OS wins 30, 12 ties.**
+
+| M | WS wins | OS wins | crossover |
+|---|---|---|---|
+| 1, 4 | — (ties for small K) | K >= 8 | at K = N_ARR |
+| 16 | K <= 4 | K >= 8 | K = 8 |
+| 64 | K <= 8 | K >= 16 | K = 16 |
+
+Representative points:
+
+| Shape | WS cycles | OS cycles | OS gain |
+|---|---|---|---|
+| 4 x 4 x 4 | 65 | 65 | tie |
+| 4 x 4 x 64 | 1265 | 623 | +50.8% |
+| 64 x 4 x 4 | 629 | 1025 | -63.0% |
+| 64 x 16 x 8 | 6049 | 6401 | -5.8% |
+| 64 x 16 x 64 | 55553 | 39809 | +28.3% |
+
+The mechanism is visible directly in the phase breakdown. On `37x10x13`,
+writeback collapses `2590 -> 370` cycles while B fetch rises `130 -> 1300`:
+OS trades C traffic for B traffic. A-operand traffic is **identical** in both
+dataflows and cancels exactly, which is what makes the comparison tractable.
+
+### Why the crossover moves with M
+
+- WS pays `2*M*N*(Ktiles-1)` extra C accesses — grows with K.
+- OS pays `K*N*(Mtiles-1)` extra B reads and `(N_ARR+1)*Mtiles*Ntiles` of
+  clear/drain — both grow with M.
+
+So larger M pushes the crossover to larger K. A rule keyed on K alone cannot
+capture this, which the policy scoring below confirms.
+
+---
+
+## 9c. Choosing a policy (Milestone 6)
+
+Candidates scored against the *measured* winner, not against the analytical
+model. Regret is cycles lost versus an oracle that always picks correctly.
+
+| Policy | Correct | Total regret | Worst case |
+|---|---|---|---|
+| always WS | 26/56 | 48190 | 103.2% |
+| always OS | 42/56 | 5390 | 63.0% |
+| `K > N_ARR` | 54/56 | 440 | 5.8% |
+| cost-difference model | **56/56** | **0** | **0.0%** |
+| ADAPTIVE (in hardware) | **56/56** | **0** | **0.0%** |
+
+`K > N_ARR` is the intuitive rule and it is nearly right, but it misses the
+large-M, `K=8` corner where OS's per-M-tile overheads still outweigh the
+writeback it saves.
+
+The shipped rule compares the two cost differences directly:
+
+```
+gain = 2*M*N*(Ktiles-1) + Ntiles*K
+cost = K*N*(Mtiles-1) + (N_ARR+1)*Mtiles*Ntiles
+choose OS when gain > cost
+```
+
+Evaluated once per transaction at start (not per cycle), so its multipliers are
+a one-shot cost off the critical path. The tile counts are ceiling-divides by
+`N_ARR`, which is a shift because `N_ARR` is a power of two.
+
+**Scope of the claim.** This is a measured fit to *this* memory model — fixed
+1-cycle latency, no contention, no double buffering. It is not a universal law,
+and the honest way to extend it is to re-run `make bench` after any change that
+alters the cost balance (double buffering in particular will shrink the fetch
+terms and should move the crossover).
+
+---
+
 ## 10. Assertion inventory
 
 | Assertion | Location | Invariant |
@@ -324,14 +437,21 @@ correcting.
 | `p_weight_stable_outside_load` | `pe.sv` | `weight_reg` changes only under LOAD |
 | row-skew check | `pe_array.sv` | an active PE receives a valid psum from the north |
 | `g_capture` timing | `accel_top.sv` | results emerge at `compute_cnt == m + c + N_ARR` |
+| `p_accum_stable_without_mac` | `pe.sv` | OS accumulator changes only on a real MAC |
 | `p_c_rd_wr_exclusive` | `accel_top.sv` | C read and write never in the same cycle |
-| `p_no_rmw_on_first_k` | `accel_top.sv` | first K tile never reads C back |
+| `p_no_rmw_on_first_k` | `accel_top.sv` | direct-write tiles never read C back |
+| `p_os_never_reads_c` | `accel_top.sv` | OS never reads C: no accumulator escapes |
+| `p_os_enters_via_clear` | `accel_top.sv` | OS transactions start from a cleared array |
+| `p_mode_stable_while_busy` | `accel_top.sv` | dataflow fixed for a transaction |
 | `p_no_reload_within_m_loop` | `accel_top.sv` | weights stay resident across M chunks |
-| `p_tile_extents_legal` | `accel_top.sv` | tile extents always within the array |
+| `p_tile_extents_legal` | `accel_top.sv` | spans non-zero and within STREAM_DEPTH |
+| `p_spatial_span_fits` | `accel_top.sv` | spatially-mapped span fits the array |
+| `p_macs_bounded` | `accel_top.sv` | never more concurrent MACs than PEs |
+| `p_no_macs_outside_compute` | `accel_top.sv` | no MACs reported outside a compute phase |
 | `p_busy_not_with_done` | `accel_top.sv` | `busy` and `done` never overlap |
 
-Not decorative: four have fired during development and three caught real RTL
-bugs (8.3, 8.6 via its data signature, 8.7).
+Not decorative: six have fired during development and five caught real RTL
+bugs (8.3, 8.6 via its data signature, 8.7, 8.8 via the MAC cross-check, 8.9).
 
 The row-skew check is stated as an **implication**, not an equality: an active
 PE must be receiving a valid psum from the north. The converse fails legitimately
@@ -360,9 +480,12 @@ Software golden GEMM: signed INT8 in, 32-bit signed accumulation, no saturation.
 
 ## 12. Not yet implemented
 
-- output-stationary dataflow and its east-flowing accumulator drain path
-- double buffering
-- hardware performance counters
-- the shape-aware scheduler and `ADAPTIVE` policy
+- **double buffering** — operand fetch is still fully serial with compute, which
+  is the largest remaining source of idle array cycles
 - pipelined C read-modify-write (deliberately non-pipelined in v1)
+- per-tile adaptive selection; the decision is currently per-transaction
 - scaling to 8x8
+
+Delivered since the original plan: output-stationary with its east-flowing
+drain path (§4), hardware performance counters (§9), the measurement sweep
+(§9b), and the shape-aware `ADAPTIVE` policy (§9c).
