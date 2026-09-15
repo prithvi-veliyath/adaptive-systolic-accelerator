@@ -220,6 +220,7 @@ module accel_top #(
     .clk           (clk),
     .rst_n         (rst_n),
     .phase         (phase),
+    .n_active      (n_tile),
     .a_in          (a_in_arr),
     .a_valid_in    (a_valid_in_arr),
     .operand_in    (operand_in_arr),

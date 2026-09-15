@@ -3,11 +3,17 @@ module pe_array #(
     parameter int N_ARR  = 4,
     parameter int DATA_W = 8,
     parameter int ACC_W  = 32,
-    localparam int MAC_CNT_W = $clog2(N_ARR*N_ARR + 1)
+    localparam int MAC_CNT_W = $clog2(N_ARR*N_ARR + 1),
+    localparam int TCNT_W    = $clog2(N_ARR + 1)
 ) (
     input  logic clk,
     input  logic rst_n,
     input  logic [1:0] phase,
+
+    // Width of the current output tile. Columns at or beyond this index
+    // hold weights from a previous tile and must not be allowed to
+    // multiply: see the gate below.
+    input  logic [TCNT_W-1:0] n_active,
 
     input  logic signed [DATA_W-1:0] a_in       [N_ARR],
     input  logic                     a_valid_in [N_ARR],
@@ -25,6 +31,7 @@ module pe_array #(
 
   logic signed [DATA_W-1:0] a_wire         [N_ARR][N_ARR+1];
   logic                     a_valid_wire   [N_ARR][N_ARR+1];
+  logic                     a_valid_gated  [N_ARR][N_ARR];
   logic signed [DATA_W-1:0] op_wire        [N_ARR+1][N_ARR];
   logic signed [ACC_W-1:0]  psum_wire      [N_ARR+1][N_ARR];
   logic                     psum_valid_wire[N_ARR+1][N_ARR];
@@ -44,12 +51,23 @@ module pe_array #(
 
     for (r = 0; r < N_ARR; r++) begin : g_row
       for (c = 0; c < N_ARR; c++) begin : g_col
+        // Ragged-N column gate. Without it the activation valid keeps
+        // travelling east past the end of the tile, and columns holding
+        // a previous tile's weights perform multiply-accumulates whose
+        // results are simply never captured. That is invisible to a
+        // correctness test -- the outputs are still right -- but it
+        // burns real MACs and real power on every ragged-N tile.
+        // Gating the first inactive column is sufficient, because an
+        // inactive PE registers a zero valid and so starves the rest of
+        // the row downstream of it.
+        assign a_valid_gated[r][c] = a_valid_wire[r][c] && (TCNT_W'(c) < n_active);
+
         pe #(.DATA_W(DATA_W), .ACC_W(ACC_W)) u_pe (
           .clk           (clk),
           .rst_n         (rst_n),
           .phase         (phase),
           .a_in          (a_wire[r][c]),
-          .a_valid_in    (a_valid_wire[r][c]),
+          .a_valid_in    (a_valid_gated[r][c]),
           .a_out         (a_wire[r][c+1]),
           .a_valid_out   (a_valid_wire[r][c+1]),
           .operand_in    (op_wire[r][c]),
@@ -73,7 +91,7 @@ module pe_array #(
           assert property (
             @(posedge clk) disable iff (!rst_n)
               (phase == 2'd2) |->
-                (a_valid_wire[r][c] |-> psum_valid_wire[r][c])
+                (a_valid_gated[r][c] |-> psum_valid_wire[r][c])
           ) else $error("row-skew mismatch at PE(%0d,%0d)", r, c);
         end
       end
@@ -99,7 +117,7 @@ module pe_array #(
     if (phase == 2'd2)
       for (int rr = 0; rr < N_ARR; rr++)
         for (int cc = 0; cc < N_ARR; cc++)
-          if (a_valid_wire[rr][cc]) active_macs = active_macs + MAC_CNT_W'(1);
+          if (a_valid_gated[rr][cc]) active_macs = active_macs + MAC_CNT_W'(1);
   end
 
 endmodule
