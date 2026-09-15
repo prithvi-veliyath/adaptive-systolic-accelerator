@@ -30,6 +30,15 @@ enum State {
 // output still reads as poison, a C write was missed.
 static const int32_t C_POISON = 0x5A5A5A5A;
 
+// Performance counter map; mirrors the PERF_* localparams in accel_top.
+enum Perf {
+  PERF_TOTAL_CYCLES = 0, PERF_COMPUTE_CYCLES = 1, PERF_BFETCH = 2,
+  PERF_WLOAD = 3, PERF_AFETCH = 4, PERF_WB = 5, PERF_STALL = 6,
+  PERF_WEIGHT_TILES = 7, PERF_M_CHUNKS = 8, PERF_MAC_OPS = 9,
+  PERF_MAC_SLOTS = 10, PERF_BYTES_A = 11, PERF_BYTES_B = 12,
+  PERF_C_WRITES = 13, PERF_C_RMW = 14, PERF_ERRORS = 15
+};
+
 struct PhaseCounts {
   int bfetch = 0, wload = 0, afetch = 0, compute = 0, wb = 0, next = 0, done = 0, other = 0;
   int total() const { return bfetch + wload + afetch + compute + wb + next + done + other; }
@@ -132,6 +141,13 @@ class Harness {
 
   int cur_state() const { return dut->rootp->accel_top__DOT__state; }
 
+  // Combinational counter read: drive the address, settle, sample.
+  uint32_t perf(int idx) {
+    dut->perf_addr = idx;
+    dut->eval();
+    return dut->perf_rdata;
+  }
+
   void account(PhaseCounts& p) {
     switch (cur_state()) {
       case S_BFETCH:  p.bfetch++;  break;
@@ -228,13 +244,54 @@ static void shape_test(Harness& h, const std::string& name, int M, int Nn, int K
   check(got.next    == exp.next,    name + ": NEXT "    + std::to_string(got.next)    + " vs model " + std::to_string(exp.next));
   check(got.other   == 0,           name + ": cycles outside defined phases");
 
+  // ---- Hardware performance counters ----
+  //
+  // The headline invariant: the array must perform exactly M*N*K
+  // multiply-accumulates. One MAC per (m,n,k) triple, no more and no
+  // fewer. This is measured from the array's own valid popcount, so it
+  // independently proves both that no work is missing and that ragged
+  // tiles waste nothing -- a zero-padding implementation would report
+  // more MACs than M*N*K.
+  uint32_t mac_ops  = h.perf(PERF_MAC_OPS);
+  uint32_t expect_macs = static_cast<uint32_t>(M) * Nn * K;
+  check(mac_ops == expect_macs,
+        name + ": MAC ops = " + std::to_string(mac_ops) + ", expected M*N*K = " +
+            std::to_string(expect_macs));
+
+  // Counters must agree with the externally observed phase occupancy.
+  check(h.perf(PERF_COMPUTE_CYCLES) == static_cast<uint32_t>(got.compute),
+        name + ": compute-cycle counter disagrees with observed occupancy");
+  check(h.perf(PERF_BFETCH) == static_cast<uint32_t>(got.bfetch),
+        name + ": bfetch counter disagrees");
+  check(h.perf(PERF_AFETCH) == static_cast<uint32_t>(got.afetch),
+        name + ": afetch counter disagrees");
+  check(h.perf(PERF_WB) == static_cast<uint32_t>(got.wb),
+        name + ": wb counter disagrees");
+  check(h.perf(PERF_TOTAL_CYCLES) == static_cast<uint32_t>(got.total() - got.done),
+        name + ": total-cycle counter disagrees with busy occupancy");
+  check(h.perf(PERF_C_WRITES) == static_cast<uint32_t>(expect_writes),
+        name + ": C-write counter disagrees with observed writes");
+  check(h.perf(PERF_C_RMW) == static_cast<uint32_t>(M) * Nn * (k_tiles - 1),
+        name + ": C read-modify-write counter wrong");
+  check(h.perf(PERF_WEIGHT_TILES) ==
+            static_cast<uint32_t>(((Nn + N_ARR - 1) / N_ARR) * k_tiles),
+        name + ": weight-tile counter wrong");
+  // Operand traffic: every A and B element of every tile is fetched once.
+  check(h.perf(PERF_BYTES_B) == static_cast<uint32_t>(exp.bfetch),
+        name + ": B byte counter disagrees with fetch cycles");
+  check(h.perf(PERF_BYTES_A) == static_cast<uint32_t>(exp.afetch),
+        name + ": A byte counter disagrees with fetch cycles");
+
   if (verbose) {
-    double util = 100.0 * got.useful() / got.total();
-    std::printf("  %-22s %3dx%3dx%3d  %s  cycles=%5d  [bf %d | wl %d | af %d | cp %d | wb %d | nx %d]"
-                "  array-active=%.1f%%\n",
+    uint32_t slots = h.perf(PERF_MAC_SLOTS);
+    double occ_compute = slots ? 100.0 * mac_ops / slots : 0.0;
+    double occ_overall = 100.0 * mac_ops /
+                         (static_cast<double>(got.total()) * N_ARR * N_ARR);
+    std::printf("  %-16s %3dx%3dx%3d  %s  cyc=%5d  [bf %4d wl %3d af %4d cp %4d wb %4d]"
+                "  MACs=%6u  occ: in-compute %5.1f%%  overall %4.1f%%\n",
                 name.c_str(), M, Nn, K, g_failures == before ? "PASS" : "FAIL",
                 got.total(), got.bfetch, got.wload, got.afetch, got.compute,
-                got.wb, got.next, util);
+                got.wb, mac_ops, occ_compute, occ_overall);
   }
 }
 
