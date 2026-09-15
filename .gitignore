@@ -1,0 +1,8 @@
+# Verilator build output
+obj_dir/
+sim/obj_dir/
+
+# Waveforms
+*.vcd
+*.fst
+*.gtkw
