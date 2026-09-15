@@ -4,8 +4,10 @@ Reference for the adaptive systolic accelerator. Tracks what is **actually
 implemented and verified**; sections marked *(planned)* are deliberately not
 built yet.
 
-**Current state: Milestones 1–6 — both dataflows on a shared array, hardware
-counters, a measured WS-vs-OS sweep, and an adaptive policy derived from it.**
+**Current state: all 7 milestones — both dataflows on a shared array, hardware
+counters, double-buffered operand prefetch, a measured WS-vs-OS sweep, and an
+adaptive policy derived from it and then re-derived after the prefetch engine
+changed the cost balance.**
 
 ---
 
@@ -423,10 +425,88 @@ a one-shot cost off the critical path. The tile counts are ceiling-divides by
 `N_ARR`, which is a shift because `N_ARR` is a power of two.
 
 **Scope of the claim.** This is a measured fit to *this* memory model — fixed
-1-cycle latency, no contention, no double buffering. It is not a universal law,
-and the honest way to extend it is to re-run `make bench` after any change that
-alters the cost balance (double buffering in particular will shrink the fetch
-terms and should move the crossover).
+1-cycle latency, no contention. It is not a universal law, and the honest way
+to extend it is to re-run `make bench` after any change that alters the cost
+balance. That warning was written before Milestone 7, and §9d is what happened
+when it was tested.
+
+---
+
+## 9d. Double buffering, and what it did to the policy (Milestone 7)
+
+### The prefetch engine
+
+The A fetch is no longer an FSM phase. It is an engine launched by whichever
+state knows the next chunk's address, which then walks the tile on its own in
+whatever state the FSM happens to be in. Two consequences, both impossible
+while the fetch was a state:
+
+- an operand fetch overlaps a compute and a writeback;
+- the A and B buses run concurrently, which matters in OS, where the next K
+  chunk's A fetch now overlaps that chunk's B fetch.
+
+`a_buf` gains a bank dimension. The engine fills one bank while the array
+computes from the other; they swap when a completed fetch is consumed, so a
+prefetch can never write the bank under compute. The swap happens on the *same*
+edge that captures the last element — both are non-blocking, so the bank becomes
+readable exactly as its final write lands.
+
+`S_AFETCH` leaves as soon as the fetch has landed **or lands on that edge**. An
+earlier version waited a cycle to observe completion, which taxed every
+cold-start fetch; that made OS 30 cycles slower on `37x10x13` while WS got
+faster, and the asymmetry is what pointed at the cold-start path.
+
+The prefetch targets the next iteration of whichever loop is innermost: the next
+M chunk in WS, the next K chunk in OS. The in-flight fetch keeps its own
+snapshot of the spans it was launched with, because the live spans move with the
+loop origins and those advance before the prefetch is consumed.
+
+| Workload | Before | After | Gain |
+|---|---|---|---|
+| WS `37x10x13` | 4911 | 4126 | 16.0% |
+| WS visible A fetch | 1443 | 658 | 54% hidden |
+| OS `4x4x20` | 215 | 200 | 7.0% |
+| OS `37x10x13` | 3835 | 3835 | none |
+
+OS gains least, and the reason is structural: its inner loop is K, so when
+`K <= STREAM_DEPTH` there is only one chunk per output tile and nothing to
+prefetch at all.
+
+### The policy broke
+
+Re-running the sweep, `ADAPTIVE` had fallen from **56/56 with zero regret** to
+**54/56 with a 9.0% worst case**. WS wins rose from 14 to 16.
+
+Making the hardware faster invalidated the scheduler. The original model let
+A-operand traffic cancel between the dataflows, because both moved the same
+elements at the same cost. Once A can overlap other work that stops holding,
+because the two dataflows have very different windows to hide it in:
+
+```
+WS inner loop is M -> A hides behind compute AND writeback; only the first
+   chunk of each tile pays in full   ->  ~Ntiles * min(M,SD) * K visible
+OS inner loop is K -> A hides only behind the tail of one compute plus the
+   next B fetch, and often not at all ->  ~Ntiles * M * min(K,SD) visible
+```
+
+Adding that difference restores 56/56 with zero regret.
+
+| Policy | Before prefetch | After prefetch |
+|---|---|---|
+| always WS | 26/56, worst 103.2% | 28/56, worst 191.8% |
+| always OS | 42/56, worst 63.0% | 40/56, worst 133.2% |
+| `K > N_ARR` | 54/56, worst 5.8% | 52/56, worst **41.1%** |
+| cost model v1 | **56/56, worst 0%** | 54/56, worst 9.0% |
+| cost model + prefetch | — | **56/56, worst 0%** |
+
+Every simpler rule degraded, and more severely than the cost model did:
+`K > N_ARR` went from a 5.8% worst case to 41.1%.
+
+**The lesson worth keeping.** A heuristic fitted to one microarchitecture does
+not survive a change to that microarchitecture. Re-running the sweep is part of
+changing the hardware, not an optional follow-up — and the reason this project
+could notice at all is that the policy was scored against measured cycles rather
+than assumed correct.
 
 ---
 
@@ -478,14 +558,23 @@ Software golden GEMM: signed INT8 in, 32-bit signed accumulation, no saturation.
 
 ---
 
-## 12. Not yet implemented
+## 12. Future work
 
-- **double buffering** — operand fetch is still fully serial with compute, which
-  is the largest remaining source of idle array cycles
-- pipelined C read-modify-write (deliberately non-pipelined in v1)
-- per-tile adaptive selection; the decision is currently per-transaction
-- scaling to 8x8
+All seven planned milestones are delivered: output-stationary with its
+east-flowing drain path (§4), hardware performance counters (§9), the
+measurement sweep (§9b), the shape-aware `ADAPTIVE` policy (§9c), and
+double-buffered prefetch with the policy re-derivation it forced (§9d).
 
-Delivered since the original plan: output-stationary with its east-flowing
-drain path (§4), hardware performance counters (§9), the measurement sweep
-(§9b), and the shape-aware `ADAPTIVE` policy (§9c).
+What remains, in rough order of value:
+
+- **Scale to 8x8 and re-run the sweep.** The crossover should move again, and
+  §9d is the template for handling it.
+- **Prefetch across tile boundaries.** Today the prefetch covers only the
+  innermost loop, so a tile's first chunk is never hidden. OS benefits least
+  precisely because its inner loop often runs exactly once — cross-tile
+  prefetch is the fix, and it would shift the crossover back toward OS.
+- **Pipeline the C read-modify-write path**, deliberately left non-pipelined
+  in v1. It is still the single largest phase for deep-K WS workloads.
+- **Per-tile adaptive selection.** The decision is currently per-transaction;
+  the shared control path already supports switching, and the PE flush makes
+  mode changes safe between tiles.
