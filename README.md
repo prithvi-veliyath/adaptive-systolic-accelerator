@@ -12,10 +12,10 @@ runtime based on matrix shape.
 Yes, and the answer is quantified below. The project is built as an experiment:
 the RTL is the instrument, and the deliverable is a measured result.
 
-**Status: Milestones 1–6 complete.** WS and OS both implemented on the shared
-array, hardware performance counters, a 56-shape measurement sweep, and an
-ADAPTIVE policy derived from that sweep that picks the faster dataflow on
-**56 of 56 shapes with zero regret.**
+**Status: all 7 milestones complete.** WS and OS on the shared array, hardware
+performance counters, double-buffered operand prefetch, a 56-shape measurement
+sweep, and an ADAPTIVE policy derived from that sweep that picks the faster
+dataflow on **56 of 56 shapes with zero regret**.
 
 ---
 
@@ -44,15 +44,8 @@ Both dataflows run on identical data over a 56-shape grid
 (`M ∈ {1,4,16,64}`, `N ∈ {4,16}`, `K ∈ {1,2,4,8,16,32,64}`), each verified
 against a golden model.
 
-**WS wins 14, OS wins 30, 12 ties.** The crossover is sharp and systematic:
-
-| M | WS wins | OS wins | crossover |
-|---|---|---|---|
-| 1, 4 | — (ties) | K ≥ 8 | at K = N_ARR |
-| 16 | K ≤ 4 | K ≥ 8 | K = 8 |
-| 64 | K ≤ 8 | K ≥ 16 | K = 16 |
-
-The crossover **K rises with M**, and that follows directly from the structural
+**WS wins 16, OS wins 28, 12 ties.** The crossover is sharp and systematic, and
+the crossover **K rises with M**. That follows directly from the structural
 asymmetry between the two dataflows:
 
 - **WS** must spill partial sums out to `C` and read them back once `K` exceeds
@@ -65,6 +58,18 @@ asymmetry between the two dataflows:
 On `37×10×13` that trade shows up in one line: writeback collapses
 **2590 → 370 cycles** while B-fetch rises **130 → 1300**.
 
+### Double buffering
+
+The A fetch is not an FSM phase but an independent prefetch engine, so an
+operand fetch overlaps compute and writeback, and the A and B buses run
+concurrently. `a_buf` is two-banked: the engine fills one bank while the array
+computes from the other.
+
+On `37×10×13` WS this cut **4911 → 4126 cycles (16%)**, with visible A-fetch
+dropping `1443 → 658`. OS gains less — its inner loop is K, so with
+`K ≤ STREAM_DEPTH` there is nothing to prefetch — which is exactly what shifted
+the crossover below.
+
 ### Choosing between them
 
 Candidate policies scored against the *measured* winner (oracle = always pick
@@ -72,26 +77,51 @@ the faster one):
 
 | Policy | Correct | Total regret | Worst case |
 |---|---|---|---|
-| always WS | 26/56 | 48190 cycles | 103.2% |
-| always OS | 42/56 | 5390 cycles | 63.0% |
-| `K > N_ARR` | 54/56 | 440 cycles | 5.8% |
-| **cost-difference model** | **56/56** | **0** | **0.0%** |
+| always WS | 28/56 | 49630 cycles | 191.8% |
+| always OS | 40/56 | 10055 cycles | 133.2% |
+| `K > N_ARR` | 52/56 | 3470 cycles | 41.1% |
+| cost-difference model (pre-prefetch) | 54/56 | 1140 cycles | 9.0% |
+| **cost model + prefetch (shipped)** | **56/56** | **0** | **0.0%** |
 | **ADAPTIVE (in hardware)** | **56/56** | **0** | **0.0%** |
 
-The obvious rule — "switch to OS once the reduction outgrows the array" — is
-good but not free. It misses the large-M, `K=8` corner, where OS's per-M-tile B
-refetch and drain overhead still outweigh the writeback it saves.
+The obvious rule — "switch to OS once the reduction outgrows the array" — is not
+free. It misses the large-M corner where OS's per-M-tile B refetch and drain
+overhead still outweigh the writeback it saves.
 
-The shipped policy compares the two cost differences directly:
+The shipped policy compares the cost differences directly:
 
 ```
-gain = 2·M·N·(Ktiles−1) + Ntiles·K          WS spill + weight reload
-cost = K·N·(Mtiles−1) + (N_ARR+1)·Mtiles·Ntiles   OS refetch + clear/drain
-choose OS when gain > cost
+favours OS:  2·M·N·(Ktiles−1)                 WS spills partial sums through C
+           + Ntiles·K                         WS reloads weights per (n,k) tile
+           + Ntiles·min(M,SD)·K               WS's A fetch is mostly hidden
+
+favours WS:  K·N·(Mtiles−1)                   OS re-reads B once per M tile
+           + (N_ARR+1)·Mtiles·Ntiles          OS clear + drain per output tile
+           + Ntiles·M·min(K,SD)               OS's A fetch is mostly visible
 ```
 
 Evaluated once per transaction at start, so the multipliers are a one-shot cost
 and not on any critical path.
+
+### The part worth reading twice
+
+The first version of this policy scored **56/56** — and then double buffering
+made it **worse**, dropping it to 54/56.
+
+Adding the prefetch engine changed which costs matter. The original model let
+A-operand traffic cancel between the dataflows, because both moved the same
+elements at the same cost. Once A can overlap other work, that stops being true:
+WS hides its A fetch behind compute *and* writeback, while OS can only hide it
+behind a much shorter window — and when `K ≤ STREAM_DEPTH` it has no second
+chunk to prefetch at all.
+
+Every simpler rule degraded too, and more severely: `K > N_ARR` went from a 5.8%
+worst case to **41.1%**.
+
+A heuristic fitted to one microarchitecture does not survive a change to that
+microarchitecture. That's the whole argument for deriving the policy from
+measurement and re-running the sweep whenever the cost balance moves — and this
+repo has the before-and-after to prove it.
 
 ---
 
@@ -222,16 +252,23 @@ single port declarations.
 | **4 — done** | Output-stationary dataflow on the shared array + drain path |
 | **5 — done** | 56-shape WS vs OS sweep; located the crossover |
 | **6 — done** | ADAPTIVE policy derived from the sweep — 56/56, zero regret |
-| 7 | Double buffering, to attack the operand-fetch stall |
-| later | Scale to 8×8 |
+| **7 — done** | Double-buffered prefetch (WS +16%); policy re-derived after it moved the crossover |
+
+### Future work
+
+- Scale to 8×8 and re-run the sweep; the crossover should move again
+- Prefetch across tile boundaries, which would help OS (its inner loop often
+  runs once, so it rarely prefetches today)
+- Pipeline the C read-modify-write path
+- Per-tile adaptive selection rather than per-transaction
 
 ---
 
 ## Known limitations
 
-- Double buffering not yet implemented — operand fetch is fully serial with
-  compute, which is why array occupancy stays low in absolute terms
 - C read-modify-write is non-pipelined (2 cycles/element) by deliberate v1 choice
+- Prefetch covers the innermost loop only, so a tile's first chunk is never
+  hidden
 - The adaptive decision is per-transaction, not per-tile
 - No accumulator saturation (32-bit wraparound, matching the golden model)
 - `M, N ≤ 255` and `K ≤ 256`, so every flat address fits in 16 bits
