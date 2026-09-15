@@ -39,7 +39,8 @@ enum Perf {
   PERF_WLOAD = 3, PERF_AFETCH = 4, PERF_WB = 5, PERF_STALL = 6,
   PERF_WEIGHT_TILES = 7, PERF_M_CHUNKS = 8, PERF_MAC_OPS = 9,
   PERF_MAC_SLOTS = 10, PERF_BYTES_A = 11, PERF_BYTES_B = 12,
-  PERF_C_WRITES = 13, PERF_C_RMW = 14, PERF_ERRORS = 15
+  PERF_C_WRITES = 13, PERF_C_RMW = 14, PERF_ERRORS = 15,
+  PERF_OS_CLEAR = 16, PERF_OS_DRAIN = 17, PERF_MODE = 18
 };
 
 struct PhaseCounts {
@@ -360,9 +361,170 @@ static void fill_random(std::vector<int8_t>& v, size_t n) {
   for (size_t i = 0; i < n; i++) v[i] = static_cast<int8_t>(rnd() & 0xFF);
 }
 
+// ---------------------------------------------------------------------
+// Milestone 5: WS vs OS measurement sweep.
+//
+// Runs both dataflows over a grid of shapes on identical data, verifies
+// each against the golden model, and records measured cycles. The point
+// is to locate the crossover empirically rather than to assume it -- the
+// adaptive policy in the next milestone is derived from this table, not
+// from the analytical cost model.
+// ---------------------------------------------------------------------
+static int ceil_div(int a, int b) { return (a + b - 1) / b; }
+
+// ---- Candidate scheduling policies ----
+// Each returns true for "choose OS". They are evaluated against the
+// measured winner below, so the policy that ships is the one the data
+// selects rather than the one that sounds right.
+
+// The obvious rule: OS pays off once the reduction outgrows the array,
+// because that is when WS starts spilling partial sums through C.
+static bool policy_k_gt_narr(int M, int Nn, int K) {
+  (void)M; (void)Nn;
+  return K > N_ARR;
+}
+
+// Cost-difference rule, derived from the structural asymmetry between
+// the two dataflows rather than fitted to the measurements:
+//
+//   WS pays 2 extra C accesses per output for every K tile after the
+//   first            -> 2*M*N*(Ktiles-1)
+//   OS re-reads the whole B tile once per M tile
+//                    -> K*N*(Mtiles-1)
+//   OS pays a clear and an N_ARR-cycle drain per output tile
+//                    -> (N_ARR+1)*Mtiles*Ntiles
+//   WS pays a weight load per (n,k) tile
+//                    -> Ntiles*K
+//
+// A-operand traffic is identical in both and cancels exactly.
+static bool policy_cost_model(int M, int Nn, int K) {
+  int ktiles = ceil_div(K, N_ARR);
+  int mtiles = ceil_div(M, N_ARR);
+  int ntiles = ceil_div(Nn, N_ARR);
+  long os_gain = 2L * M * Nn * (ktiles - 1) + (long)ntiles * K;
+  long os_cost = (long)K * Nn * (mtiles - 1) + (long)(N_ARR + 1) * mtiles * ntiles;
+  return os_gain > os_cost;
+}
+
+struct PolicyStat {
+  const char* name;
+  int correct = 0;
+  long regret = 0;      // total cycles lost vs always picking the winner
+  double worst = 0.0;   // worst single-shape loss, percent
+};
+
+static void score(PolicyStat& s, bool pick_os, int wc, int oc) {
+  int chosen = pick_os ? oc : wc;
+  int best   = std::min(wc, oc);
+  if (chosen == best) s.correct++;
+  s.regret += (chosen - best);
+  double loss = 100.0 * (chosen - best) / static_cast<double>(best);
+  if (loss > s.worst) s.worst = loss;
+}
+
+static void run_sweep(Harness& h) {
+  h.trace_en = false;
+
+  std::FILE* csv = std::fopen("../docs/benchmark.csv", "w");
+  if (csv) {
+    std::fprintf(csv, "M,N,K,ws_cycles,os_cycles,winner,os_speedup,"
+                      "ws_wb,os_wb,ws_bfetch,os_bfetch,ws_afetch,os_afetch,"
+                      "ws_compute,os_compute,macs\n");
+  } else {
+    std::printf("note: could not open ../docs/benchmark.csv for writing; "
+                "results are printed below only\n");
+  }
+
+  const int Ms[] = {1, 4, 16, 64};
+  const int Ns[] = {4, 16};
+  const int Ks[] = {1, 2, 4, 8, 16, 32, 64};
+
+  std::printf("\n%6s %4s %4s | %8s %8s | %-6s %7s | %s\n",
+              "M", "N", "K", "WS cyc", "OS cyc", "winner", "OS gain", "where the cycles go");
+  std::printf("%s\n", std::string(96, '-').c_str());
+
+  int ws_wins = 0, os_wins = 0, ties = 0, points = 0;
+  PolicyStat st_ws{"always WS"}, st_os{"always OS"};
+  PolicyStat st_k{"K > N_ARR"}, st_cm{"cost-difference model"};
+  PolicyStat st_hw{"ADAPTIVE (in hardware)"};
+
+  for (int mi = 0; mi < 4; mi++)
+    for (int ni = 0; ni < 2; ni++)
+      for (int ki = 0; ki < 7; ki++) {
+        int M = Ms[mi], Nn = Ns[ni], K = Ks[ki];
+        std::vector<int8_t> A, B;
+        fill_random(A, static_cast<size_t>(M) * K);
+        fill_random(B, static_cast<size_t>(K) * Nn);
+        std::vector<int32_t> gold;
+        golden(M, Nn, K, A, B, gold);
+
+        PhaseCounts ws = h.run_gemm(M, Nn, K, A, B, FORCE_WS);
+        bool ws_ok = (h.mem.c == gold);
+        uint32_t macs = h.perf(PERF_MAC_OPS);
+
+        PhaseCounts os = h.run_gemm(M, Nn, K, A, B, FORCE_OS);
+        bool os_ok = (h.mem.c == gold);
+
+        check(ws_ok, "sweep: WS result wrong");
+        check(os_ok, "sweep: OS result wrong");
+
+        int wc = ws.total(), oc = os.total();
+        const char* win = (oc < wc) ? "OS" : (wc < oc) ? "WS" : "tie";
+        if (oc < wc) os_wins++; else if (wc < oc) ws_wins++; else ties++;
+        double gain = 100.0 * (wc - oc) / static_cast<double>(wc);
+
+        // ADAPTIVE on the same shape: the hardware picks for itself, and
+        // must land on the faster of the two and still be correct.
+        PhaseCounts ad = h.run_gemm(M, Nn, K, A, B, ADAPTIVE);
+        check(h.mem.c == gold, "sweep: ADAPTIVE result wrong");
+        bool ad_chose_os = (h.perf(PERF_MODE) != 0);
+        int ac = ad.total();
+        check(ac == (ad_chose_os ? oc : wc),
+              "sweep: ADAPTIVE cycles do not match the dataflow it reported");
+
+        points++;
+        score(st_ws, false, wc, oc);
+        score(st_os, true,  wc, oc);
+        score(st_k,  policy_k_gt_narr(M, Nn, K), wc, oc);
+        score(st_cm, policy_cost_model(M, Nn, K), wc, oc);
+        score(st_hw, ad_chose_os, wc, oc);
+
+        std::printf("%6d %4d %4d | %8d %8d | %-6s %6.1f%% | "
+                    "wb %5d->%-5d  bf %5d->%-5d\n",
+                    M, Nn, K, wc, oc, win, gain, ws.wb, os.wb, ws.bfetch, os.bfetch);
+
+        if (csv) {
+          std::fprintf(csv, "%d,%d,%d,%d,%d,%s,%.4f,%d,%d,%d,%d,%d,%d,%d,%d,%u\n",
+                       M, Nn, K, wc, oc, win, gain / 100.0,
+                       ws.wb, os.wb, ws.bfetch, os.bfetch,
+                       ws.afetch, os.afetch, ws.compute, os.compute, macs);
+        }
+      }
+
+  if (csv) std::fclose(csv);
+  std::printf("%s\n", std::string(96, '-').c_str());
+  std::printf("WS wins: %d   OS wins: %d   ties: %d   (of %d shapes)\n",
+              ws_wins, os_wins, ties, points);
+
+  // Which scheduling rule should the adaptive policy use? Scored against
+  // the measured winner, not against the analytical model.
+  std::printf("\nPolicy evaluation (oracle = always pick the measured winner)\n");
+  std::printf("%-24s %8s %12s %10s\n", "policy", "correct", "total regret", "worst");
+  const PolicyStat* all[] = {&st_ws, &st_os, &st_k, &st_cm, &st_hw};
+  for (const PolicyStat* s : all) {
+    std::printf("%-24s %5d/%-3d %12ld %9.1f%%\n",
+                s->name, s->correct, points, s->regret, s->worst);
+  }
+  h.trace_en = true;
+}
+
 int main(int argc, char** argv) {
   Verilated::commandArgs(argc, argv);
   Verilated::traceEverOn(true);
+
+  bool sweep_only = false;
+  for (int i = 1; i < argc; i++)
+    if (std::string(argv[i]) == "--sweep") sweep_only = true;
 
   Vaccel_top* dut = new Vaccel_top;
   VerilatedVcdC* tfp = new VerilatedVcdC;
@@ -372,7 +534,19 @@ int main(int argc, char** argv) {
   Harness h(dut, tfp);
   h.reset();
 
-  std::printf("=== Milestone 2: tiled weight-stationary GEMM ===\n");
+  if (sweep_only) {
+    std::printf("=== WS vs OS measurement sweep (N_ARR=%d, STREAM_DEPTH=%d) ===\n",
+                N_ARR, STREAM_DEPTH);
+    run_sweep(h);
+    tfp->close();
+    dut->final();
+    delete dut; delete tfp;
+    if (g_failures == 0) std::printf("\nSWEEP COMPLETE\n");
+    else                 std::printf("\n%d CHECK(S) FAILED\n", g_failures);
+    return g_failures == 0 ? 0 : 1;
+  }
+
+  std::printf("=== Dual-dataflow systolic accelerator ===\n");
   std::printf("N_ARR=%d  STREAM_DEPTH=%d\n\n", N_ARR, STREAM_DEPTH);
 
   // ---- Directed value coverage on the exact-fit shape ----
@@ -458,6 +632,47 @@ int main(int argc, char** argv) {
     h.trace_en = true;
   }
 
+  // ---- ADAPTIVE: the hardware must choose, and choose correctly ----
+  std::printf("\n-- adaptive policy --\n");
+  {
+    int before = g_failures;
+    struct AdCase { const char* name; int M, N, K; bool expect_os; };
+    // Expectations come from the Milestone 5 measurements, not from
+    // re-running the same formula the RTL uses -- otherwise this would
+    // only prove the hardware agrees with itself.
+    const AdCase cases[] = {
+      {"small_square",  4,  4,  4, false},  // tie; either is acceptable
+      {"deep_k",        4,  4, 32, true },  // OS by 48%
+      {"tall_thin_m",  64,  4,  4, false},  // WS by 63%
+      {"wide_k",        1, 16, 64, true },  // OS by 38%
+      {"big_m_small_k",64, 16,  8, false},  // WS by 5.8%
+      {"big_m_deep_k", 64,  4, 32, true },  // OS by 24%
+    };
+    for (const auto& c : cases) {
+      std::vector<int8_t> A, B;
+      fill_random(A, static_cast<size_t>(c.M) * c.K);
+      fill_random(B, static_cast<size_t>(c.K) * c.N);
+      std::vector<int32_t> gold;
+      golden(c.M, c.N, c.K, A, B, gold);
+      h.trace_en = false;
+      PhaseCounts p = h.run_gemm(c.M, c.N, c.K, A, B, ADAPTIVE);
+      h.trace_en = true;
+      bool chose_os = (h.perf(PERF_MODE) != 0);
+      check(h.mem.c == gold, std::string(c.name) + ": ADAPTIVE result wrong");
+      // The 4x4x4 case is a genuine tie, so only the decisive shapes
+      // are held to a specific choice.
+      if (c.M != 4 || c.N != 4 || c.K != 4) {
+        check(chose_os == c.expect_os,
+              std::string(c.name) + ": ADAPTIVE chose " + (chose_os ? "OS" : "WS") +
+                  ", measurements favour " + (c.expect_os ? "OS" : "WS"));
+      }
+      std::printf("  %-16s %3dx%3dx%3d  chose %s  cyc=%d\n",
+                  c.name, c.M, c.N, c.K, chose_os ? "OS" : "WS", p.total());
+    }
+    std::printf("  %-22s %s\n", "adaptive_choices",
+                g_failures == before ? "PASS" : "FAIL");
+  }
+
   // ---- Randomized shape sweep, both dataflows on identical data ----
   std::printf("\n-- randomized shapes (WS and OS) --\n");
   {
@@ -520,12 +735,10 @@ int main(int argc, char** argv) {
   {
     int before = g_failures;
     struct PC { int policy; const char* name; bool err; };
-    // FORCE_WS and FORCE_OS are both implemented. ADAPTIVE must still
-    // error rather than silently picking one: the scheduler that would
-    // make the choice does not exist yet, and a silent fallback would
-    // corrupt every measurement taken through it.
+    // All three real policies are implemented; RESERVED must still be
+    // rejected rather than aliased onto one of them.
     const PC cases[] = {{0,"FORCE_WS",false},{1,"FORCE_OS",false},
-                        {2,"ADAPTIVE",true},{3,"RESERVED",true}};
+                        {2,"ADAPTIVE",false},{3,"RESERVED",true}};
     for (const auto& pc : cases) {
       h.reset();
       dut->cfg_m = 4; dut->cfg_n = 4; dut->cfg_k = 4;
